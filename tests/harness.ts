@@ -241,9 +241,20 @@ export async function engineHarness(
 
 /** One scripted response with an honest usage baseline of `inputTokens`. */
 export function usageResponse(text: string, inputTokens: number): StreamChunk[] {
+  return usageResponseWith(text, inputTokens, 5)
+}
+
+/**
+ * {@link usageResponse} with an explicit output count.
+ *
+ * Window accounting has to ignore the previous response's output, so a case
+ * that pins that behaviour needs to control the output size, not inherit the
+ * five-token default.
+ */
+export function usageResponseWith(text: string, inputTokens: number, outputTokens: number): StreamChunk[] {
   return [
     ...textResponse(text).slice(0, -1),
-    { type: 'usage', usage: { inputTokens, outputTokens: 5 } },
+    { type: 'usage', usage: { inputTokens, outputTokens } },
     { type: 'finish', reason: { kind: 'stop' } },
   ]
 }
