@@ -44,11 +44,15 @@
 
 ## 安装
 
+最新版本（插件压缩包就挂在这个 release 上）：
+
+**https://github.com/mumchristmas/dsh-context-rollover/releases/latest**
+
 你已经在用 DSH，所以直接让会话里的 Agent 装：
 
 ```text
-请把 dsh-context-rollover 的最新压缩包下载到当前工作目录，并把它装进我的 "<profile>"
-profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
+请把 dsh-context-rollover 的最新 release 附件下载到当前工作目录，并把它装进我的
+"<profile>" profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
 
   curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
   dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
