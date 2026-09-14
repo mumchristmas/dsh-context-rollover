@@ -127,49 +127,29 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
   return defineTool({
     name: 'get_context_remaining',
     description:
-      'Report how full the context window is: the prompt tokens the next request will submit, the room '
-      + 'left in the window, and the growth left before the automatic rollover. Takes no arguments; call '
-      + 'it to read the measured numbers — the current context state is not derivable from repository '
-      + 'files or from the plugin source.',
+      'Report context-window pressure as measured numbers: `prompt used` is what the next request '
+      + 'would submit (a projection that moves with every turn and drops at a rollover, not a tally of '
+      + 'what was spent), `window left` is the room before the hard limit, and `rollover at` is how much '
+      + 'further prompt growth remains before an automatic rollover. Takes no arguments; call it to read '
+      + 'the numbers — this state is not derivable from repository files or from the plugin source.',
     parameters: {},
     output: {
       schema: { type: 'json' },
       render: (_args, rawValue) => {
         const value = rawValue as unknown as ContextRemainingResult
         if (value.prompt_tokens === null || value.context_window === null) {
-          return [{
-            type: 'text',
-            text: 'Not measured yet: no request has reported usage in this window. '
-              + 'There is no honest reading to give — call again after the next model response.',
-          }]
+          return [{ type: 'text', text: 'not measured yet' }]
         }
-        const lines: string[] = [
-          `Context window: ${value.context_window.toLocaleString('en-US')} tokens.`,
-          `The next request will submit about ${value.prompt_tokens.toLocaleString('en-US')} prompt tokens `
-          + `(${Math.round((value.prompt_tokens / value.context_window) * 100)}% of the window).`,
+        const num = (n: number): string => n.toLocaleString('en-US')
+        const lines = [
+          `prompt used   ${num(value.prompt_tokens)} / ${num(value.context_window)} `
+          + `(${Math.round((value.prompt_tokens / value.context_window) * 100)}%)`,
         ]
-        if (value.surface_tokens !== null) {
-          lines.push(
-            `Of those, the active conversation accounts for about `
-            + `${value.surface_tokens.toLocaleString('en-US')} tokens; the rest is the system prompt, `
-            + 'tool schemas, and per-step context.',
-          )
-        }
-        if (value.prompt_tokens_left !== null) {
-          lines.push(
-            `Room left in the window: about ${value.prompt_tokens_left.toLocaleString('en-US')} tokens.`,
-          )
-        }
+        if (value.surface_tokens !== null) lines.push(`  of which conversation ${num(value.surface_tokens)}`)
+        if (value.prompt_tokens_left !== null) lines.push(`window left   ${num(value.prompt_tokens_left)}`)
         if (value.rollover_tokens_left !== null) {
-          lines.push(
-            `Automatic rollover in about ${value.rollover_tokens_left.toLocaleString('en-US')} tokens `
-            + 'of further growth.',
-          )
+          lines.push(`rollover in   ${num(value.rollover_tokens_left)}`)
         }
-        lines.push(
-          'This is a projection that moves with every turn, not a tally of what has been spent; '
-          + 'it drops when a rollover rebuilds the active context.',
-        )
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },

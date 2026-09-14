@@ -256,12 +256,12 @@ export class ContextRolloverEngine extends CompactionEngine {
       content: [{
         type: 'text',
         text:
-          `Context window at ${windowPercent}%: the next request would submit about `
-          + `${promptTokens.toLocaleString('en-US')} of ${contextWindow.toLocaleString('en-US')} prompt `
-          + `tokens, and an automatic rollover starts at about ${rolloverTokens.toLocaleString('en-US')}. `
-          + 'The active context is a projection that moves with every turn, not a tally of what has been '
-          + 'spent. If a task boundary is near, save what matters to notes and call new_context with a '
-          + 'short handoff; otherwise checkpoint soon.',
+          `Context window ${windowPercent}%: prompt used ${promptTokens.toLocaleString('en-US')} / `
+          + `${contextWindow.toLocaleString('en-US')}, window left `
+          + `${Math.max(0, contextWindow - promptTokens).toLocaleString('en-US')}, automatic rollover `
+          + `in ${Math.max(0, rolloverTokens - promptTokens).toLocaleString('en-US')}. `
+          + 'At a task boundary, save notes and call new_context with a short handoff; otherwise '
+          + 'checkpoint soon.',
       }],
       source: {
         kind: 'plugin',

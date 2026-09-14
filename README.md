@@ -45,13 +45,22 @@ Responsibilities stay split (the Codex lesson):
 - **`new_context({ handoff? })`** — request a context boundary at the next safe
   point. The handoff (bounded) becomes part of the new window's checkpoint. The
   boundary is crossed at a safe lifecycle point, never mid-tool-batch.
-- **`get_context_remaining()`** — honest headroom, in the window's own terms:
-  the prompt tokens the next request would submit, the room left in the hard
-  window, and the growth left before the automatic rollover — or "not measured
-  yet". It is a projection that moves with every turn (a rollover lowers it),
-  never a tally of what has been spent. The same quantity drives the pressure
-  reminder and the rollover threshold, measured as the prompt a request would
-  carry and not as the previous call's prompt plus its output.
+- **`get_context_remaining()`** — the numbers, in the window's own terms:
+
+  ```text
+  prompt used   15,255 / 32,000 (48%)
+    of which conversation 3,100
+  window left   16,745
+  rollover at   13,545 more
+  ```
+
+  `prompt used` is what the next request would submit — a projection that
+  moves with every turn and drops at a rollover, not a tally of what was
+  spent; `window left` is the room before the hard limit; `rollover at` is how
+  much further growth remains. A window with no honest reading yet answers
+  `not measured yet`. The same quantity drives the pressure reminder and the
+  rollover threshold, measured as the prompt a request would carry and not as
+  the previous call's prompt plus its output.
 - **`notes`** — `list | read | write | append | search` over per-session
   markdown files under `<dsh home>/notes/<session id>/`. Nothing is written
   automatically; the model decides what survives.

@@ -112,11 +112,11 @@ describe('pressure accounting', () => {
 
     const reminders = reminderTexts(session)
     expect(reminders).toHaveLength(1)
-    // The reminder names the quantity it reports: what the next request would
-    // submit, out of the window — not a tally of what was spent.
-    expect(reminders[0]).toContain('Context window at 25%')
-    expect(reminders[0]).toContain('about 25,000 of 100,000 prompt tokens')
-    expect(reminders[0]).not.toContain('29000')
-    expect(reminders[0]).toMatch(/projection that moves with every turn, not a tally/)
+    // The reminder leads with the numbers and labels them the same way the
+    // tool does: the prompt the next request would submit, out of the window.
+    expect(reminders[0]).toContain('prompt used 25,000 / 100,000')
+    expect(reminders[0]).toContain('window left 75,000')
+    expect(reminders[0]).toContain('automatic rollover in 65,000')
+    expect(reminders[0]).not.toContain('29,000')
   })
 })

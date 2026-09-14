@@ -60,9 +60,9 @@ describe('get_context_remaining discoverability', () => {
       output?: { render?: (args: unknown, value: unknown) => { text: string }[] }
     }
     const description = definition.description ?? ''
-    // The description must not promise a "remaining" number without saying
-    // remaining of what, and must not call the reading "used".
-    expect(description).toMatch(/prompt tokens the next request will submit/i)
+    // The semantics live in the description, so the output can stay terse.
+    expect(description).toMatch(/what the next request would submit/i)
+    expect(description).toMatch(/projection that moves with every turn/i)
     expect(description).not.toMatch(/context used/i)
 
     const render = definition.output?.render
@@ -76,15 +76,15 @@ describe('get_context_remaining discoverability', () => {
     }) ?? []
     const text = lines.map(line => line.text).join('\n')
 
-    // A projection, said plainly, and never "used".
-    expect(text).toMatch(/will submit about 15,255 prompt tokens/)
-    expect(text).toMatch(/48% of the window/)
-    expect(text).toMatch(/the active conversation accounts for about 3,100 tokens/)
-    expect(text).toMatch(/Room left in the window: about 16,745 tokens/)
-    expect(text).toMatch(/Automatic rollover in about 13,545 tokens/)
-    expect(text).toMatch(/projection that moves with every turn, not a tally/)
-    expect(text).not.toMatch(/Context used/i)
+    // Numbers first, one short label each, nothing else.
+    expect(text).toBe([
+      'prompt used   15,255 / 32,000 (48%)',
+      '  of which conversation 3,100',
+      'window left   16,745',
+      'rollover in   13,545',
+    ].join('\n'))
     expect(text).not.toMatch(/used_tokens/)
+    expect(text).not.toMatch(/Context used/i)
 
     // Unmeasured is stated as unmeasured, never as a number.
     const empty = (render?.({}, {
@@ -94,7 +94,7 @@ describe('get_context_remaining discoverability', () => {
       prompt_tokens_left: null,
       rollover_tokens_left: null,
     }) ?? []).map(line => line.text).join('\n')
-    expect(empty).toMatch(/Not measured yet/)
-    expect(empty).not.toMatch(/0 tokens/)
+    expect(empty).toBe('not measured yet')
+    expect(empty).not.toMatch(/[0-9]/)
   })
 })
