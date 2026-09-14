@@ -15,7 +15,7 @@ import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { ResolvedRolloverConfig } from './config.ts'
 import { readHistoryItem, searchHistory } from './history.ts'
 import { NotesStore } from './notes.ts'
-import { countRollovers, rolloverSummarySeqs } from './rollover.ts'
+import { countRollovers, measuredPromptTokens, rolloverSummarySeqs } from './rollover.ts'
 import type { PendingRollover } from './state.ts'
 
 /** Runtime collaborators the tool bodies need. */
@@ -46,12 +46,22 @@ function notesStoreFor(config: ResolvedRolloverConfig, session: Session): NotesS
   return new NotesStore(NotesStore.directoryFor(session.id, config.notesDir))
 }
 
-/** The availability output of `get_context_remaining`. */
+/**
+ * The availability output of `get_context_remaining`.
+ *
+ * `prompt_tokens` is what the next request will submit, not a running total of
+ * what has been spent: the active surface is rebuilt from notes and the recent
+ * tail at a rollover, so this number can fall without any provider traffic.
+ * `surface_tokens` is the part of that prompt the conversation itself
+ * accounts for — the rest is the system prompt, the tool schemas, and the
+ * per-step context DSH injects.
+ */
 interface ContextRemainingResult {
-  tokens_left: number | null
-  used_tokens: number | null
+  prompt_tokens: number | null
+  surface_tokens: number | null
   context_window: number | null
-  auto_rollover_tokens_left: number | null
+  prompt_tokens_left: number | null
+  rollover_tokens_left: number | null
 }
 
 /** The `new_context` tool: request a context boundary at the next safe point. */
@@ -117,28 +127,49 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
   return defineTool({
     name: 'get_context_remaining',
     description:
-      'Get the remaining tokens in the current context window, and the headroom before the automatic '
-      + 'rollover. Takes no arguments; call it to read the measured numbers — the current context state '
-      + 'is not derivable from repository files or from the plugin source.',
+      'Report how full the context window is: the prompt tokens the next request will submit, the room '
+      + 'left in the window, and the growth left before the automatic rollover. Takes no arguments; call '
+      + 'it to read the measured numbers — the current context state is not derivable from repository '
+      + 'files or from the plugin source.',
     parameters: {},
     output: {
       schema: { type: 'json' },
       render: (_args, rawValue) => {
         const value = rawValue as unknown as ContextRemainingResult
-        const lines: string[] = []
-        if (value.tokens_left === null || value.used_tokens === null) {
-          lines.push('Context usage is not measured yet; no honest reading is available.')
-        } else {
-          lines.push(`Context used: ~${value.used_tokens} tokens.`)
-          lines.push(`Remaining before the hard context window: ~${value.tokens_left} tokens.`)
-          if (value.context_window !== null && value.used_tokens > 0) {
-            const percent = Math.min(100, Math.round((value.used_tokens / value.context_window) * 100))
-            lines.push(`Context window: ~${value.context_window} tokens (${percent}% used).`)
-          }
-          if (value.auto_rollover_tokens_left !== null) {
-            lines.push(`Remaining before the automatic rollover: ~${value.auto_rollover_tokens_left} tokens.`)
-          }
+        if (value.prompt_tokens === null || value.context_window === null) {
+          return [{
+            type: 'text',
+            text: 'Not measured yet: no request has reported usage in this window. '
+              + 'There is no honest reading to give — call again after the next model response.',
+          }]
         }
+        const lines: string[] = [
+          `Context window: ${value.context_window.toLocaleString('en-US')} tokens.`,
+          `The next request will submit about ${value.prompt_tokens.toLocaleString('en-US')} prompt tokens `
+          + `(${Math.round((value.prompt_tokens / value.context_window) * 100)}% of the window).`,
+        ]
+        if (value.surface_tokens !== null) {
+          lines.push(
+            `Of those, the active conversation accounts for about `
+            + `${value.surface_tokens.toLocaleString('en-US')} tokens; the rest is the system prompt, `
+            + 'tool schemas, and per-step context.',
+          )
+        }
+        if (value.prompt_tokens_left !== null) {
+          lines.push(
+            `Room left in the window: about ${value.prompt_tokens_left.toLocaleString('en-US')} tokens.`,
+          )
+        }
+        if (value.rollover_tokens_left !== null) {
+          lines.push(
+            `Automatic rollover in about ${value.rollover_tokens_left.toLocaleString('en-US')} tokens `
+            + 'of further growth.',
+          )
+        }
+        lines.push(
+          'This is a projection that moves with every turn, not a tally of what has been spent; '
+          + 'it drops when a rollover rebuilds the active context.',
+        )
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
@@ -149,19 +180,17 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
         ? null
         : Math.floor(contextWindow * deps.config.thresholdRatio)
       const measurement = deps.meter.measure(session)
-      const hasReading = measurement.baseline.kind !== 'none'
-      const usedTokens = hasReading ? measurement.totalTokens : null
-      const tokensLeft = contextWindow === null || usedTokens === null
-        ? null
-        : Math.max(0, contextWindow - usedTokens)
-      const autoRolloverLeft = thresholdTokens === null || usedTokens === null
-        ? null
-        : Math.max(0, thresholdTokens - usedTokens)
+      const promptTokens = measuredPromptTokens(measurement)
       return {
-        tokens_left: tokensLeft,
-        used_tokens: usedTokens,
+        prompt_tokens: promptTokens,
+        surface_tokens: measurement.baseline.kind === 'none' ? null : measurement.surfaceTokens,
         context_window: contextWindow,
-        auto_rollover_tokens_left: autoRolloverLeft,
+        prompt_tokens_left: contextWindow === null || promptTokens === null
+          ? null
+          : Math.max(0, contextWindow - promptTokens),
+        rollover_tokens_left: thresholdTokens === null || promptTokens === null
+          ? null
+          : Math.max(0, thresholdTokens - promptTokens),
       }
     },
   })

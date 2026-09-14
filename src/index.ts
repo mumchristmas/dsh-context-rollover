@@ -35,6 +35,7 @@ import {
   claimReminder,
   commitRollover,
   countRollovers,
+  measuredPromptTokens,
   REMINDER_SUMMARY_PREFIX,
   selectRolloverRange,
 } from './rollover.ts'
@@ -239,28 +240,34 @@ export class ContextRolloverEngine extends CompactionEngine {
     const contextWindow = session.requestContext()?.contextWindow
     if (contextWindow === undefined) return undefined
     const measurement = this.ctx.tokenMeter.measure(session)
-    if (measurement.baseline.kind === 'none') return undefined
+    // The prompt the next request would submit — the quantity the window
+    // actually constrains. Not a tally: a rollover lowers it.
+    const promptTokens = measuredPromptTokens(measurement)
+    if (promptTokens === null) return undefined
     const reminderTokens = Math.floor(contextWindow * this.config.reminderThresholdRatio)
-    if (measurement.totalTokens < reminderTokens) return undefined
+    if (promptTokens < reminderTokens) return undefined
     // Claimed synchronously: on a preset deployment the host row and the
     // preset row both observe this pre-step, and neither delivery is in the
     // log yet when the second one decides.
     if (!claimReminder(session)) return undefined
     const rolloverTokens = Math.floor(contextWindow * this.config.thresholdRatio)
-    const percent = Math.min(100, Math.round((measurement.totalTokens / contextWindow) * 100))
+    const windowPercent = Math.min(100, Math.round((promptTokens / contextWindow) * 100))
     return createUserMessage({
       content: [{
         type: 'text',
         text:
-          `Context window: ${percent}% used (~${measurement.totalTokens} of ${contextWindow} tokens). `
-          + `An automatic rollover starts around ${rolloverTokens} tokens. If a task boundary is near, `
-          + 'save what matters to notes and call new_context with a short handoff; otherwise checkpoint soon.',
+          `Context window at ${windowPercent}%: the next request would submit about `
+          + `${promptTokens.toLocaleString('en-US')} of ${contextWindow.toLocaleString('en-US')} prompt `
+          + `tokens, and an automatic rollover starts at about ${rolloverTokens.toLocaleString('en-US')}. `
+          + 'The active context is a projection that moves with every turn, not a tally of what has been '
+          + 'spent. If a task boundary is near, save what matters to notes and call new_context with a '
+          + 'short handoff; otherwise checkpoint soon.',
       }],
       source: {
         kind: 'plugin',
         plugin: name,
         form: 'notice',
-        summary: boundContextSummary(`${REMINDER_SUMMARY_PREFIX} (${percent}% used)`),
+        summary: boundContextSummary(`${REMINDER_SUMMARY_PREFIX} (${windowPercent}% of window)`),
       },
     })
   }
@@ -277,9 +284,10 @@ export class ContextRolloverEngine extends CompactionEngine {
     const contextWindow = agent.session.requestContext()?.contextWindow
     if (contextWindow === undefined) return
     const measurement = this.ctx.tokenMeter.measure(agent.session)
-    if (measurement.baseline.kind === 'none') return
+    const promptTokens = measuredPromptTokens(measurement)
+    if (promptTokens === null) return
     const rolloverTokens = Math.floor(contextWindow * this.config.thresholdRatio)
-    if (measurement.totalTokens < rolloverTokens) return
+    if (promptTokens < rolloverTokens) return
     if (this.pressureRolledTurns.has(turnKey(agent.session.id, turn))) {
       this.ctx.logger.warn(
         `context rollover: usage is still above the automatic threshold after this turn's pressure `

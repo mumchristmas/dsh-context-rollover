@@ -45,8 +45,13 @@ Responsibilities stay split (the Codex lesson):
 - **`new_context({ handoff? })`** — request a context boundary at the next safe
   point. The handoff (bounded) becomes part of the new window's checkpoint. The
   boundary is crossed at a safe lifecycle point, never mid-tool-batch.
-- **`get_context_remaining()`** — honest headroom: tokens left before the hard
-  window and before the automatic rollover, or "not measured yet".
+- **`get_context_remaining()`** — honest headroom, in the window's own terms:
+  the prompt tokens the next request would submit, the room left in the hard
+  window, and the growth left before the automatic rollover — or "not measured
+  yet". It is a projection that moves with every turn (a rollover lowers it),
+  never a tally of what has been spent. The same quantity drives the pressure
+  reminder and the rollover threshold, measured as the prompt a request would
+  carry and not as the previous call's prompt plus its output.
 - **`notes`** — `list | read | write | append | search` over per-session
   markdown files under `<dsh home>/notes/<session id>/`. Nothing is written
   automatically; the model decides what survives.
@@ -267,7 +272,7 @@ is load-bearing, not an optimization.
 
 ## Tests and typecheck (no DSH build needed)
 
-The sibling DSH checkout is the source of truth: `tsconfig.base.json` paths are
+The DSH source checkout is the source of truth: `tsconfig.base.json` paths are
 generated into `tsconfig.dsh-paths.json` and vitest aliases execute everything
 from TypeScript source — the same source plane DSH's own suites use. Vendored
 packages typecheck against their built declarations so `skipLibCheck` absorbs
@@ -285,6 +290,32 @@ validated against DSH's own invariants. The integration test proves the
 semantic experiment end to end: the model researches, calls `new_context`
 mid-turn, and the fresh window carries notes + handoff + recent tail while the
 turn continues.
+
+## Working in this checkout
+
+This checkout keeps a deliberately strict **public zone / dev zone** split:
+`main` and `feature/*` are publishable and PR-ready, while `dev`, local notes,
+the DSH checkout, and machine-specific config live in a private, gitignored dev
+zone backed by a local bare remote. A pre-push guard blocks dev-zone material
+from reaching GitHub. [`ZONES.md`](ZONES.md) is the reference;
+[`CONTRIBUTING.md`](CONTRIBUTING.md) is the workflow.
+
+```sh
+pnpm dev:setup    # pinned DSH checkout + deps + private remote + zone guard
+pnpm dev:doctor   # is the environment wired correctly?
+pnpm dev:verify   # prove the zone split holds (guard matrix + repo state)
+```
+
+Two differences from a plain checkout, both local-only:
+
+- the DSH sources are resolved by `scripts/dsh-dir.mjs` — `DSH_CHECKOUT_DIR`
+  (environment, then `.env.local`), else `vendor/deepseek-harness`, which
+  `pnpm dev:setup` clones at the pinned ref. CI keeps working with
+  `DSH_CHECKOUT_DIR=./deepseek-harness`;
+- `pnpm build` resolves `@deepseek-ai/*` to built declarations, preferring a
+  built checkout and otherwise the host installation closure
+  (`$DSH_HOME/profiles/node_modules/@deepseek-ai`); `DSH_BUILD_TYPES_DIR`
+  overrides it. `pnpm dev:doctor` reports which source is in use.
 
 ## Scope and limits
 

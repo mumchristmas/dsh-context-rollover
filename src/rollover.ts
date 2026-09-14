@@ -478,3 +478,39 @@ export function resetReminderClaims(session: Session): void {
   claimsOn(session).clear()
   fallbackClaims.delete(session)
 }
+
+/**
+ * Prompt tokens a request submitted now would carry, from one measurement.
+ *
+ * A projection, not a tally: it is what the window has to hold on the next
+ * call, and a rollover lowers it by rebuilding the active surface. Nothing has
+ * been "used" in the sense of spent — the number moves with the conversation
+ * in both directions.
+ *
+ * `TokenMeasurement.totalTokens` speaks in the meter's own terms: when it
+ * anchors on a completed call it uses `usageTokens(usage)`, which sums that
+ * call's prompt **and its output** — and the next request does not carry the
+ * previous response's output. Comparing that total against the context window
+ * therefore over-reports every window by one assistant response: measured
+ * 2,000–5,100 tokens on a 32k test window, i.e. 6–16%, which fires the
+ * reminder and the automatic rollover early.
+ *
+ * Only a `usage` baseline can be corrected this way: an estimated baseline
+ * never counted an output.
+ * @param measurement - one token-meter measurement.
+ * @returns the prompt tokens a request would submit now.
+ */
+export function requestPressureTokens(measurement: TokenMeasurement): number {
+  const usage = measurement.baseline.kind === 'usage' ? measurement.baseline.usage : undefined
+  return Math.max(0, measurement.totalTokens - (usage?.outputTokens ?? 0))
+}
+
+/**
+ * {@link requestPressureTokens} with the "not measured yet" case kept
+ * distinguishable, which is how the pressure paths treat an absent baseline.
+ * @param measurement - one token-meter measurement.
+ * @returns the prompt tokens, or `null` when no honest reading exists.
+ */
+export function measuredPromptTokens(measurement: TokenMeasurement): number | null {
+  return measurement.baseline.kind === 'none' ? null : requestPressureTokens(measurement)
+}

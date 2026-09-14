@@ -52,4 +52,49 @@ describe('get_context_remaining discoverability', () => {
     // guess is exactly what the live session produced.
     expect(CONTEXT_MANAGEMENT_GUIDANCE).toMatch(/fabrication/i)
   })
+
+  it('names the measured quantity for what it is, in the tool output', async () => {
+    const { ctx } = await engineHarness('tool-wording', {})
+    const definition = toolDefinition(ctx, 'get_context_remaining') as {
+      description?: string
+      output?: { render?: (args: unknown, value: unknown) => { text: string }[] }
+    }
+    const description = definition.description ?? ''
+    // The description must not promise a "remaining" number without saying
+    // remaining of what, and must not call the reading "used".
+    expect(description).toMatch(/prompt tokens the next request will submit/i)
+    expect(description).not.toMatch(/context used/i)
+
+    const render = definition.output?.render
+    expect(typeof render).toBe('function')
+    const lines = render?.({}, {
+      prompt_tokens: 15255,
+      surface_tokens: 3100,
+      context_window: 32000,
+      prompt_tokens_left: 16745,
+      rollover_tokens_left: 13545,
+    }) ?? []
+    const text = lines.map(line => line.text).join('\n')
+
+    // A projection, said plainly, and never "used".
+    expect(text).toMatch(/will submit about 15,255 prompt tokens/)
+    expect(text).toMatch(/48% of the window/)
+    expect(text).toMatch(/the active conversation accounts for about 3,100 tokens/)
+    expect(text).toMatch(/Room left in the window: about 16,745 tokens/)
+    expect(text).toMatch(/Automatic rollover in about 13,545 tokens/)
+    expect(text).toMatch(/projection that moves with every turn, not a tally/)
+    expect(text).not.toMatch(/Context used/i)
+    expect(text).not.toMatch(/used_tokens/)
+
+    // Unmeasured is stated as unmeasured, never as a number.
+    const empty = (render?.({}, {
+      prompt_tokens: null,
+      surface_tokens: null,
+      context_window: 32000,
+      prompt_tokens_left: null,
+      rollover_tokens_left: null,
+    }) ?? []).map(line => line.text).join('\n')
+    expect(empty).toMatch(/Not measured yet/)
+    expect(empty).not.toMatch(/0 tokens/)
+  })
 })
