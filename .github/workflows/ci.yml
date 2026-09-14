@@ -19,11 +19,11 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # The generators resolve DSH sources through the sibling checkout;
-      # CI checks out the harness fork into the workspace and points
+      # CI checks out the official harness into the workspace and points
       # DSH_CHECKOUT_DIR at it.
       - uses: actions/checkout@v4
         with:
-          repository: athif23/deepseek-harness
+          repository: deepseek-ai/deepseek-harness
           path: deepseek-harness
       # The generators and tests resolve DSH through the sibling checkout:
       # its dependencies and built lib/types must exist, exactly like local

@@ -6,11 +6,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/athif23/dsh-context-rollover.git"
+    "url": "git+https://github.com/mumchristmas/dsh-context-rollover.git"
   },
-  "homepage": "https://github.com/athif23/dsh-context-rollover#readme",
+  "homepage": "https://github.com/mumchristmas/dsh-context-rollover#readme",
   "bugs": {
-    "url": "https://github.com/athif23/dsh-context-rollover/issues"
+    "url": "https://github.com/mumchristmas/dsh-context-rollover/issues"
   },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
