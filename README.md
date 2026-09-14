@@ -51,71 +51,19 @@ through (`compaction @ 80%` here), so the rollover threshold can stay below it.
 
 ## Install
 
-Every version ships as a **built tarball attached to its GitHub release** — the release is
-the distribution channel, not npm. Pick the release, install its tarball, restart the
-profile.
-
-### Let an agent do it
-
-Paste this into the agent you already work with (Claude Code, Codex, or a DSH session):
+You already run DSH, so hand it to the agent in a session:
 
 ```text
-Read https://github.com/mumchristmas/dsh-context-rollover/releases/latest and install that
-release into my "<profile>" profile — from its release tarball, not from npm.
+Download the latest dsh-context-rollover tarball into this working directory and install it
+into my "<profile>" profile — from the release asset, not npm — then restart that profile:
 
-1. Download the asset `dsh-context-rollover-<version>.tgz` from that release page, where
-   <version> is the version in the release tag.
-2. Run: dsh plugin --profile <profile> add <path to that .tgz>
-3. Restart that profile once — its plugin composition changed.
-4. Verify and report both results: `/rollover status` in a session, and the
-   "Context Rollover" card under Settings → Plugin configuration.
-5. Tell me which version you installed.
-
-If that release carries no .tgz asset, stop and tell me. Do not install from npm, and do
-not build from source.
-```
-
-The agent needs shell access and a working `dsh`. If it gets stuck, do the same thing by
-hand:
-
-### Or do it by hand
-
-```sh
-curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
-dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
-```
-
-Installing changes the profile's plugin composition, so **restart the profile once** after
-the first install. Then, in any session:
-
-```text
-/rollover status
-```
-
-It reports the mode, the thresholds, the session's compaction backend, and whether the
-interceptor is active. Removing it is the same command with `remove` — `ctx.compaction`
-never changed hands, so nothing needs repairing.
-
-### Why the tarball, and what does not work
-
-Nothing runs on your machine at install time: `dsh plugin add <tarball>` unpacks a
-prebuilt `lib/`.
-
-- **npm** — the registry copy is an older line; the release is the supported version.
-- **`dsh plugin add github:mumchristmas/dsh-context-rollover`** — a git install pulls
-  *source*, and no build script runs for you (pnpm blocks git-dependency build scripts by
-  default), so `lib/` would be missing.
-- **Building it yourself** works, and needs a DSH **source** checkout — the build reads
-  DSH's type declarations from `packages/*/src`, so the app's bundled
-  `…/dependencies/dsh` (an install, not a checkout) is not enough:
-
-  ```sh
-  git clone --depth 1 --branch v0.3.1 https://github.com/mumchristmas/dsh-context-rollover
-  cd dsh-context-rollover
-  pnpm install --ignore-scripts
-  DSH_CHECKOUT_DIR=/path/to/deepseek-harness pnpm pack
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
   dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
-  ```
+```
+
+By hand it is the same two commands. The profile restarts once because its plugin
+composition changed; after that, the card under **Settings → Plugin configuration** and the
+mode button under the composer show you it is live.
 
 ## Use
 

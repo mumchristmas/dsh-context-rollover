@@ -44,64 +44,18 @@
 
 ## 安装
 
-每个版本都以**构建好的 tarball 附件形式挂在对应的 GitHub Release 上**——发布渠道是
-Release，不是 npm。选好版本，装它的 tarball，然后重启 profile。
-
-### 让 Agent 帮你装
-
-把下面这段发给你平时用的 Agent（Claude Code、Codex，或一个 DSH 会话）：
+你已经在用 DSH，所以直接让会话里的 Agent 装：
 
 ```text
-请读 https://github.com/mumchristmas/dsh-context-rollover/releases/latest，把那个 release
-装进我的 "<profile>" profile —— 用 release 里的 tarball 附件，不要用 npm。
+请把 dsh-context-rollover 的最新压缩包下载到当前工作目录，并把它装进我的 "<profile>"
+profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
 
-1. 从该 release 页面下载附件 `dsh-context-rollover-<version>.tgz`，<version> 就是 release
-   标签里的版本号。
-2. 执行：dsh plugin --profile <profile> add <上面那个 .tgz 的路径>
-3. 重启该 profile 一次 —— 它的插件组合变了。
-4. 验证并回报两项结果：会话里的 `/rollover status`，以及 设置 → 插件配置 里的
-   "Context Rollover" 卡片。
-5. 告诉我你装的是哪个版本。
-
-如果那个 release 没有 .tgz 附件，停下来告诉我。不要改用 npm，也不要从源码构建。
-```
-
-Agent 需要有 shell 权限和可用的 `dsh`。如果它卡住了，手工路径就是同样的步骤：
-
-### 或者手工执行
-
-```sh
-curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
-dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
-```
-
-安装会改变 profile 的插件组合，所以首次安装后**重启该 profile 一次**。然后在任意会话里：
-
-```text
-/rollover status
-```
-
-它会报告模式、阈值、本会话的压缩后端，以及拦截器是否生效。卸载就是把同样的命令换成
-`remove` —— `ctx.compaction` 从未易主，不需要任何修复。
-
-### 为什么用 tarball，以及哪些方式不行
-
-安装时不会在你机器上跑任何东西：`dsh plugin add <tarball>` 解包的就是预构建好的 `lib/`。
-
-- **npm** —— 注册表上那份是更早的版本线；受支持的是 Release。
-- **`dsh plugin add github:mumchristmas/dsh-context-rollover`** —— git 安装拉的是**源码**，
-  而且没有任何环节替你运行构建脚本（pnpm 默认拒绝执行 git 依赖的构建脚本），装完会缺
-  `lib/`。
-- **自己构建**可行，但需要一个 DSH **源码**检出——构建要从 `packages/*/src` 读 DSH 的
-  类型声明，所以应用自带的 `…/dependencies/dsh`（那是安装包，不是检出）不够用：
-
-  ```sh
-  git clone --depth 1 --branch v0.3.1 https://github.com/mumchristmas/dsh-context-rollover
-  cd dsh-context-rollover
-  pnpm install --ignore-scripts
-  DSH_CHECKOUT_DIR=/path/to/deepseek-harness pnpm pack
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
   dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
-  ```
+```
+
+手工执行就是同样两条命令。因为插件组合变了，profile 需要重启一次；之后 **设置 → 插件配置**
+里的卡片和输入框下方的模式按钮，就是它已经生效的凭证。
 
 ## 怎么用
 
