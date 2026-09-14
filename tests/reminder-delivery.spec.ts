@@ -1,19 +1,19 @@
 /**
  * Pressure-reminder delivery across engine rows.
  *
- * On the Web profile the engine is mounted twice — the host bundle row and the
- * session's agent-preset row — and each row loads its **own module instance**
- * behind a preset `isolate` realm (they cannot share a Cordis container: the
- * `compaction` service may only be provided once). `modelSurface` decides which
- * row owns the model-facing tools, but both rows register `agent/pre-step`
- * unconditionally, and that event is a waterfall: the outer listener decides
- * while the inner one runs, so neither decision has reached the log when the
- * second one asks.
+ * The plugin can be mounted more than once — the host row plus any user preset
+ * that mounts it — and each copy loads its **own module instance** (they cannot
+ * share a Cordis container: the `compaction` service may only be provided
+ * once). Each row registers `agent/pre-step` unconditionally, and that event is
+ * a waterfall: the outer listener decides while the inner one runs, so neither
+ * decision has reached the log when the second one asks.
  *
  * A module-scoped claim therefore cannot be the whole answer, and a
- * per-instance Set is not an answer at all. The durable log is what both rows
- * share, so `reminderDelivered` decides, and `claimReminder` adds the
+ * per-instance Set is not an answer at all. The durable log is what every row
+ * shares, so `reminderDelivered` decides, and `claimReminder` adds the
  * synchronous claim that the same module instance needs inside one waterfall.
+ * Rows that do not own a session's automatic policy stay silent entirely, so
+ * the reminder's numbers always come from the thresholds that session uses.
  *
  * @module tests/reminder-delivery
  */

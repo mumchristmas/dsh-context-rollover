@@ -1,8 +1,9 @@
 /**
- * Host/preset ownership: the host engine stands down when the session's agent
- * preset provides its own compaction backend, so two backends never race one
- * pressure signal. Rosterless deployments keep the host behavior (covered by
- * the engine suite's no-roster tests).
+ * Host/preset ownership under a preset-free design: the plugin's model surface
+ * is registered everywhere, the backend API still defers to whoever provides
+ * `ctx.compaction`, and model-requested `new_context` rollovers stay this
+ * plugin's own promise on every session. The *automatic* cross-realm
+ * interception itself is covered by the realm cases in `preempt.spec.ts`.
  *
  * @module tests/preset-deferral
  */
@@ -15,6 +16,7 @@ import { countRollovers } from '../src/rollover.ts'
 import { ContextRolloverEngine } from '../src/index.ts'
 import { resolveConfig } from '../src/config.ts'
 import {
+  derivedTexts,
   engineHarness,
   followup,
   mountTestContext,
@@ -61,7 +63,7 @@ describe('preset ownership', () => {
 
     const owned = await engineHarness('defer-region')
     provideRoster(owned.ctx, {} as CompactionEngine)
-    await expect(owned.engine.compactRegion(start, end, owned.agent)).rejects.toThrow(/owned by its agent preset/)
+    await expect(owned.engine.compactRegion(start, end, owned.agent)).rejects.toThrow(/owned by another backend/)
 
     const selfOwned = await engineHarness('defer-region-self')
     // Real agent-presets addressing returns the Cordis-traced service, not the
@@ -70,60 +72,46 @@ describe('preset ownership', () => {
     await expect(selfOwned.engine.compactRegion(start, end, selfOwned.agent)).rejects.toThrow(/not found in surface/)
   })
 
-  it('answers new_context honestly instead of promising a boundary', async () => {
+  it('keeps a model-requested new_context promise even where a preset owns compaction', async () => {
     const { ctx, agent, session } = await engineHarness('defer-honest')
     provideRoster(ctx, {} as CompactionEngine)
     const adapter = new ScriptedAdapter([
+      ...Array.from({ length: 6 }, (_unused, index) => textResponse(`background ${index}`)),
       newContextCall('{"handoff":"Continue the work."}'),
       textResponse('noted'),
     ])
     ctx.llm.registerAdapter(['mock'], adapter)
+    await seedExchanges(agent, 6)
 
     await followup(agent, 'Roll over, please.')
 
-    // Nothing was recorded and nothing committed; the model-visible result
-    // points at the preset that actually rolls over.
-    expect(countRollovers(session)).toBe(0)
+    // A model-requested boundary is this plugin's own promise: another
+    // backend owning automatic compaction never turns it down, and the
+    // checkpoint carries the handoff.
+    expect(countRollovers(session)).toBe(1)
     const tailResultSeq = session.surface.nodes
       .map(seq => session.eventAt(seq))
       .filter(event => event?.type === 'tool/result')
       .map(event => event?.seq)
       .pop()
     const tailResult = tailResultSeq === undefined ? undefined : session.eventAt(tailResultSeq)
-    expect(JSON.stringify(tailResult?.data)).toContain('agent preset')
+    expect(JSON.stringify(tailResult?.data)).toContain('without summarizing')
+    expect(derivedTexts(session).join('\n')).toContain('Continue the work.')
   })
 
-  it('registers no global tools where a preset roster exists', async () => {
-    const ctx = await mountTestContext()
-    provideRoster(ctx, undefined)
-    const engine = new ContextRolloverEngine(ctx, { notesDir: await tempNotesDir() })
-    expect(engine).toBeDefined()
-    // Preset deployments surface these tools from their own composition;
-    // globals would leak rollover-framed tools into unopted presets.
-    for (const name of ['new_context', 'get_context_remaining', 'notes', 'history']) {
-      expect(ctx.tools.get(name)).toBeUndefined()
-    }
-    const prompt = await ctx.systemPrompt.assemble({})
-    expect(prompt.sections.some(section => section.text.includes('temporary working memory'))).toBe(false)
-  })
-
-  it('registers global tools on rosterless deployments', async () => {
+  it('registers its model surface on rosterless deployments', async () => {
     const { ctx } = await engineHarness('defer-tools-present')
     for (const name of ['new_context', 'get_context_remaining', 'notes', 'history']) {
       expect(ctx.tools.get(name)).toBeDefined()
     }
   })
 
-  it(`registers model surface for the preset role even where a roster exists`, async () => {
+  it('registers the same model surface where a preset roster exists', async () => {
     const ctx = await mountTestContext()
     provideRoster(ctx, undefined)
-    // The generated preset row sets `modelSurface: 'always'`: this engine
-    // owns its composition, so the roster must not suppress its tools or
-    // guidance.
-    const engine = new ContextRolloverEngine(ctx, {
-      notesDir: await tempNotesDir(),
-      modelSurface: 'always',
-    })
+    // Preset-free design: the plugin is not an opt-in composition any more, so
+    // a roster must not suppress its tools or guidance.
+    const engine = new ContextRolloverEngine(ctx, { notesDir: await tempNotesDir() })
     expect(engine).toBeDefined()
     for (const name of ['new_context', 'get_context_remaining', 'notes', 'history']) {
       expect(ctx.tools.get(name)).toBeDefined()
@@ -132,9 +120,13 @@ describe('preset ownership', () => {
     expect(prompt.sections.some(section => section.text.includes('temporary working memory'))).toBe(true)
   })
 
-  it('fails loud on an unknown model-surface role', () => {
-    expect(() => resolveConfig({ modelSurface: 'sometimes' as unknown as 'auto' }))
-      .toThrow(/modelSurface must be/)
-    expect(resolveConfig({}).modelSurface).toBe('auto')
+  it('defaults below the stock backend threshold and validates the ratios', () => {
+    // The plugin must reach the window before the stock `compaction-basic`
+    // default (0.8), or a preset session would summarize first.
+    const defaults = resolveConfig({})
+    expect(defaults.thresholdRatio).toBeLessThan(0.8)
+    expect(defaults.reminderThresholdRatio).toBeLessThanOrEqual(defaults.thresholdRatio)
+    expect(() => resolveConfig({ thresholdRatio: 0.5, reminderThresholdRatio: 0.9 }))
+      .toThrow(/must not exceed/)
   })
 })

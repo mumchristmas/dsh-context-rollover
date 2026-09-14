@@ -12,12 +12,14 @@ import z from '@deepseek-ai/schemastery'
 export interface RolloverConfig {
   /**
    * Automatic rollover pressure point as a fraction of the routed model's
-   * context window. Defaults to `0.9`.
+   * context window. Defaults to `0.75`, which is deliberately below the stock
+   * `compaction-basic` default (`0.8`): the plugin intercepts compaction in
+   * every session, so it must reach the window first.
    */
   thresholdRatio?: number
   /**
    * One-time checkpoint reminder point as a fraction of the context window.
-   * Defaults to `0.75`.
+   * Defaults to `0.6`.
    */
   reminderThresholdRatio?: number
   /**
@@ -38,12 +40,20 @@ export interface RolloverConfig {
   /** Base directory for note files; defaults to `<dsh home>/notes/<session id>`. */
   notesDir?: string
   /**
-   * Model-surface registration: `auto` registers tools and guidance only
-   * where no preset roster exists (the host row), while `always` registers
-   * them unconditionally (the preset row, which owns its composition).
-   * Defaults to `auto`.
+   * Intercept the session's compaction backend: measure pressure and roll the
+   * window over before that backend reaches its own threshold, in any session
+   * of any agent preset. `false` yields every automatic path (pressure and
+   * overflow) to that backend while model-requested `new_context` rollovers
+   * keep working. Defaults to `true`.
    */
-  modelSurface?: 'auto' | 'always'
+  preempt?: boolean
+  /**
+   * Mount this plugin as `ctx.compaction` itself instead of as an
+   * interceptor. Only for deployments that disable `compaction-basic`; a
+   * session whose realm already provides compaction refuses the second
+   * provider. Defaults to `false` (interceptor).
+   */
+  backend?: boolean
 }
 
 /** Schemastery validation for {@link RolloverConfig}. */
@@ -56,7 +66,8 @@ export const Config: z<RolloverConfig> = z.object({
   notesEnabled: z.boolean(),
   historyEnabled: z.boolean(),
   notesDir: z.string(),
-  modelSurface: z.union(['auto', 'always'] as const),
+  preempt: z.boolean(),
+  backend: z.boolean(),
 })
 
 /** Resolved and validated rollover configuration. */
@@ -70,7 +81,8 @@ export interface ResolvedRolloverConfig {
   readonly notesEnabled: boolean
   readonly historyEnabled: boolean
   readonly notesDir: string | undefined
-  readonly modelSurface: 'auto' | 'always'
+  readonly preempt: boolean
+  readonly backend: boolean
 }
 
 /** Reject a ratio that cannot represent a fraction of a context window. */
@@ -87,8 +99,8 @@ function validateRatio(name: string, value: number): void {
  * @returns the resolved configuration.
  */
 export function resolveConfig(config: RolloverConfig): ResolvedRolloverConfig {
-  const thresholdRatio = config.thresholdRatio ?? 0.9
-  const reminderThresholdRatio = config.reminderThresholdRatio ?? 0.75
+  const thresholdRatio = config.thresholdRatio ?? 0.75
+  const reminderThresholdRatio = config.reminderThresholdRatio ?? 0.6
   const retainRatio = config.retainRatio ?? 0.1
   validateRatio('thresholdRatio', thresholdRatio)
   validateRatio('reminderThresholdRatio', reminderThresholdRatio)
@@ -107,12 +119,6 @@ export function resolveConfig(config: RolloverConfig): ResolvedRolloverConfig {
   if (!Number.isSafeInteger(handoffMaxChars) || handoffMaxChars <= 0) {
     throw new TypeError(`context-rollover: handoffMaxChars must be a positive integer, got ${String(handoffMaxChars)}`)
   }
-  const modelSurface = config.modelSurface ?? 'auto'
-  if (modelSurface !== 'auto' && modelSurface !== 'always') {
-    throw new TypeError(
-      `context-rollover: modelSurface must be 'auto' or 'always', got ${String(modelSurface)}`,
-    )
-  }
   return {
     thresholdRatio,
     reminderThresholdRatio,
@@ -122,6 +128,7 @@ export function resolveConfig(config: RolloverConfig): ResolvedRolloverConfig {
     notesEnabled: config.notesEnabled ?? true,
     historyEnabled: config.historyEnabled ?? true,
     notesDir: config.notesDir,
-    modelSurface,
+    preempt: config.preempt ?? true,
+    backend: config.backend ?? false,
   }
 }

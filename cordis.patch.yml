@@ -1,27 +1,27 @@
-# Bundle patch: become the active compaction backend and mount the plugin.
+# Bundle patch: mount the rollover interceptor.
 #
-# Layer order: base bundle rows are applied first, then this bundle's patch.
-# `disabled: true` replaces the `compaction-basic` row's state (precedent:
-# the web-app bundle disables the same row by id). `command-compact` stays
-# mounted — it injects `ctx.compaction`, which this bundle provides.
-- id: compaction-basic
-  disabled: true
+# The plugin adds a prepended `agent/pre-step` listener, its model-facing
+# tools, and `/rollover now` to *every* session of *every* preset, from the
+# host plane. It never disables, replaces, or retunes the session's compaction
+# backend: `ctx.compaction` keeps its owner and its threshold, and the plugin
+# wins simply by having the earlier pressure point (its default 0.75 against
+# the stock backend's 0.8). Removing this bundle therefore removes a listener
+# and four tools — no session and no preset depends on it.
 - insert:
     - id: context-rollover
       name: dsh-context-rollover
       config: {}
 
-# Web profiles compose compaction per session from agent presets, where a host
-# engine never runs: this engine defers to any preset-owned backend, so the
-# host row above only serves rosterless deployments (headless, base-only
-# profiles). This row registers the shipped `standard-rollover` preset beside
-# the deployment's own set — installing the bundle is enough: restart once,
-# then open new sessions on it. `baseUrl` is the profile directory at boot,
-# which keeps the path correct in every install layout (profile, link, and
-# registry installs). Profiles without a preset roster (headless) report one
-# harmless loader warning for the unmatched id and are otherwise unaffected. A
-# deployment that restates the whole `agent-presets` config in a later layer
-# takes precedence and simply hides this preset.
+# The `standard-rollover` preset is a legacy id kept only so sessions created
+# during the earlier preset-based experiment still resume: it is now a verbatim
+# copy of the shipped `standard` composition, with no row from this package, so
+# it behaves exactly like `standard` and is safe to delete once no session
+# records it. `baseUrl` is the profile directory at boot, which keeps the path
+# correct in every install layout (profile, link, and registry installs).
+# Profiles without a preset roster (headless) report one harmless loader
+# warning for the unmatched id and are otherwise unaffected. A deployment that
+# restates the whole `agent-presets` config in a later layer takes precedence
+# and simply hides this preset.
 - id: agent-presets
   config:
     default: standard

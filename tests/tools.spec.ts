@@ -122,3 +122,30 @@ describe('history tool rendering', () => {
     expect(read.value).toMatchObject({ action: 'read' })
   })
 })
+
+describe('new_context honesty', () => {
+  it('refuses a boundary when the active context has nothing to shadow', async () => {
+    // A fresh session is all system head and one exchange: the retained tail
+    // already covers every surface node, so no rollover could commit. Saying
+    // "accepted" here would promise a window that never starts.
+    const { ctx, agent } = await engineHarness('tools-new-context-minimal')
+    const result = await executeTool(ctx, agent, 'new_context', {}, 'nc1')
+    expect(result.isError).toBe(false)
+    expect(result.value).toMatchObject({ accepted: false })
+    expect(renderedText(result)).toContain('already minimal')
+  })
+
+  it('accepts a boundary once real conversation has accumulated', async () => {
+    const { ctx, agent } = await engineHarness('tools-new-context-ready')
+    const adapter = new ScriptedAdapter(
+      Array.from({ length: 12 }, (_unused, index) => textResponse(`background detail ${index}`)),
+    )
+    ctx.llm.registerAdapter(['mock'], adapter)
+    await seedExchanges(agent, 8)
+
+    const result = await executeTool(ctx, agent, 'new_context', { handoff: 'carry on' }, 'nc2')
+    expect(result.isError).toBe(false)
+    expect(result.value).toMatchObject({ accepted: true })
+    expect(renderedText(result)).toContain('without summarizing')
+  })
+})

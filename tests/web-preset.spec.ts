@@ -1,9 +1,12 @@
 /**
  * Preset-sync coverage: `scripts/make-web-preset.mjs` regenerates the shipped
- * `standard-rollover` preset from a shipped `standard` composition, fails loud
- * when the shipped shape drifts or flags are invalid, and the committed
- * preset always matches a fresh sync. The bundle patch's preset-root
- * expression is evaluated with the real loader against a fake profile dir.
+ * legacy `standard-rollover` preset as a verbatim copy of a shipped
+ * `standard` composition, fails loud when that composition is missing, and the
+ * committed preset always matches a fresh sync. The copy carries no row from
+ * this package — the plugin intercepts compaction from the host plane — so a
+ * session that recorded the id simply resumes on the stock backend. The bundle
+ * patch's preset-root expression is evaluated with the real loader against a
+ * fake profile dir.
  *
  * The script runs as a real subprocess against temp directories, so this
  * suite covers the shipped artifact rather than an import of it.
@@ -67,59 +70,39 @@ function run(args: readonly string[]): string {
 }
 
 describe('make-web-preset', () => {
-  it('derives standard-rollover with the engine row and untouched surroundings', () => {
+  it('copies the shipped composition verbatim, with nothing from this package', () => {
     const { presetsDir, outDir, cleanup } = scratch(standardFixture())
     try {
-      run(['--presets-dir', presetsDir, '--out-dir', outDir, '--retain-tokens', '12000'])
+      run(['--presets-dir', presetsDir, '--out-dir', outDir])
       const composition = readFileSync(join(outDir, 'standard-rollover', 'agent.cordis.yml'), 'utf8')
-      expect(composition).not.toContain(`name: '@deepseek-ai/dsh-compaction-basic'`)
-      expect(composition).toContain('- id: context-rollover')
-      // Portable relative specifier: the temp out dir sits beside nothing, so
-      // the entry must stay a relative path into this package's lib.
-      expect(composition).toContain(`name: '`)
-      expect(composition).toContain('lib/index.js')
-      expect(composition).toContain('thresholdRatio: 0.9')
-      expect(composition).toContain('retainTokens: 12000')
-      expect(composition).not.toContain('retainRatio')
-      // The preset row owns its model-facing tools and guidance explicitly.
-      expect(composition).toContain(`modelSurface: 'always'`)
-      // Untouched rows survive byte-identical around the swap.
-      expect(composition).toContain(`- id: persona\n  name: '@deepseek-ai/dsh-persona'`)
-      expect(composition).toContain(`- id: command-compact\n      name: '@deepseek-ai/dsh-command-compact'`)
+      // Byte-identical to the source: the legacy id must resolve to the stock
+      // composition, because the plugin is no longer part of any preset.
+      expect(composition).toBe(standardFixture())
+      expect(composition).not.toContain('context-rollover')
+      expect(composition).not.toContain('lib/index.js')
       const meta = readFileSync(join(outDir, 'standard-rollover', 'preset.yml'), 'utf8')
       expect(meta).toContain('order: 2')
+      expect(meta).toContain('legacy id')
     } finally {
       cleanup()
     }
   })
 
-  it('fails loud when the shipped row is absent', () => {
-    const { presetsDir, outDir, cleanup } = scratch('# no compaction here\n- id: persona\n  name: x\n')
+  it('fails loud when the source composition is absent', () => {
+    const { outDir, cleanup } = scratch(standardFixture())
+    const empty = join(outDir, 'nowhere')
     try {
-      expect(() => run(['--presets-dir', presetsDir, '--out-dir', outDir])).toThrow(/compaction-basic row/)
+      expect(() => run(['--presets-dir', empty, '--out-dir', outDir])).toThrow(/no "standard" preset found/)
     } finally {
       cleanup()
     }
   })
 
-  it('fails loud when the shipped row gains an unexpected config block', () => {
-    const changed = standardFixture().replace(
-      `    - id: compaction-basic\n      name: '@deepseek-ai/dsh-compaction-basic'\n`,
-      `    - id: compaction-basic\n      name: '@deepseek-ai/dsh-compaction-basic'\n      config:\n        future: true\n`,
-    )
-    const { presetsDir, outDir, cleanup } = scratch(changed)
-    try {
-      expect(() => run(['--presets-dir', presetsDir, '--out-dir', outDir])).toThrow(/unexpected config block/)
-    } finally {
-      cleanup()
-    }
-  })
-
-  it('rejects out-of-range flags', () => {
+  it('rejects an invalid preset id', () => {
     const { presetsDir, outDir, cleanup } = scratch(standardFixture())
     try {
-      expect(() => run(['--presets-dir', presetsDir, '--out-dir', outDir, '--threshold-ratio', '2']))
-        .toThrow(/in \(0, 1\]/)
+      expect(() => run(['--presets-dir', presetsDir, '--out-dir', outDir, '--preset-id', 'Bad Id']))
+        .toThrow(/--preset-id must match/)
     } finally {
       cleanup()
     }

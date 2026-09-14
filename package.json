@@ -1,7 +1,7 @@
 {
   "name": "dsh-context-rollover",
   "description": "Model-driven context-window rollover bundle for the DeepSeek Harness: fresh working context, durable model-managed notes, a small verbatim recent tail, and targeted history recovery — no summarization.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -19,6 +19,9 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -30,17 +33,24 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
     }
   },
   "scripts": {
     "generate:paths": "node scripts/generate-dsh-paths.mjs",
-    "build": "node scripts/generate-dsh-build-paths.mjs && tsc -p tsconfig.build.json",
+    "build": "node scripts/generate-dsh-build-paths.mjs && tsc -p tsconfig.build.json && node scripts/build-client.mjs",
     "preset:sync": "node scripts/make-web-preset.mjs",
     "test": "node scripts/generate-dsh-paths.mjs && vitest run",
     "typecheck": "node scripts/generate-dsh-paths.mjs && tsc -p tsconfig.json",
     "prepack": "npm run build",
     "typecheck:compat": "node scripts/generate-dsh-build-paths.mjs compat && tsc -p tsconfig.compat.json",
-    "compat:install": "pnpm --dir compat install"
+    "compat:install": "pnpm --dir compat install",
+    "build:client": "node scripts/build-client.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.0",

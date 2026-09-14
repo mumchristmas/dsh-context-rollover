@@ -17,16 +17,23 @@ protocol and compaction transaction.
 
 ## How it works
 
-The plugin provides the active `ctx.compaction` engine (it disables
-`dsh-compaction-basic` in its bundle patch). On the Web profile the engine
-must additionally live in the session's agent preset — see
-[Web profiles](#web-profiles-preset-sessions) below. A rollover is a real DSH
-compaction: `compaction/start` → `compaction/summary` → one replacement
-`user/message` with full source provenance → `compaction/end` — but the
-"summary" is a **deterministic checkpoint** (durable notes plus an optional
-handoff), never an LLM call. Raw session events stay persisted; a
-token-budgeted recent tail stays verbatim on the surface; `deriveMessages()`
-rebuilds automatically.
+The plugin is an **interceptor**, not a replacement, and it needs no preset:
+it mounts at the host plane and its listeners are untagged, so they see every
+session's events whatever preset that session runs. It registers its
+`agent/pre-step` listener with `prepend`, so on every step it measures pressure
+and crosses the boundary *before* the session's compaction backend (the shipped
+`dsh-compaction-basic`, host-plane or preset-owned) reaches its own threshold.
+That backend keeps its service, its identity, and its `/compact` path; after a
+rollover it simply measures a smaller prompt and does nothing. See
+[Interception and removability](#interception-and-removability) for the
+threshold contract.
+
+A rollover is a real DSH compaction: `compaction/start` →
+`compaction/summary` → one replacement `user/message` with full source
+provenance → `compaction/end` — but the "summary" is a **deterministic
+checkpoint** (durable notes plus an optional handoff), never an LLM call. Raw
+session events stay persisted; a token-budgeted recent tail stays verbatim on
+the surface; `deriveMessages()` rebuilds automatically.
 
 Responsibilities stay split (the Codex lesson):
 
@@ -67,6 +74,78 @@ Responsibilities stay split (the Codex lesson):
 - **`history`** — `search | read` over conversation that left the active
   surface. Targeted recovery, not wholesale reconstruction.
 
+### Settings
+
+The plugin registers one settings namespace (`context-rollover`), so the Web
+settings page shows a **Plugin configuration → Context rollover** card. The
+`cordis.yml` row stays the composition layer: the card stores only what a user
+changed, each field shows whether it is overridden, and *Reset* clears it back
+to that layer. A write the engine could not run with (a reminder point above the
+rollover point, a ratio outside `(0, 1]`) is refused before it is persisted, and
+the effective configuration is re-resolved on every change — an edited threshold
+applies to the next step, no restart.
+
+The card keeps only what a session's owner actually tunes: the rollover
+threshold, the reminder point, the retained tail in tokens (empty means the
+deployment's share of the window), and whether the plugin takes over compaction
+at all. A guardrail (handoff size) sits behind an **Advanced** disclosure;
+retention as a *share* of the window and the `notes`/`history` tool mounts stay
+deployment configuration, because two retention controls that override each
+other read as a trap and tool mounts are not rollover policy. Overridden fields
+are marked and reset individually, or all at once back to the deployment's
+values.
+
+The card also does the arithmetic a threshold cannot do alone: it reads what the
+plugin knows about the compaction backends around it — the backends it has
+actually resolved for a session (`GET /context-rollover/backends`), the presets
+whose compositions mount a compactor, and the stock backend's unconfigured
+default — and warns when the configured rollover threshold is **not below** the
+backend's, which is the one misconfiguration that silently hands every session
+to the summarizer. Deployments without a web server simply omit that route; the
+card keeps the rest of its guidance.
+
+### Languages
+
+The plugin ships English and Chinese (`zh`, the two languages the browser
+client carries). Human-facing text follows the same durable locale preference
+the rest of the UI uses, resolved at call time, so switching the GUI language
+changes the `/rollover` results, the status report, and the pressure reminder
+without a restart:
+
+- **Host text** — command description, command results, status report, and the
+  reminder — is rendered through `src/i18n.ts` from
+  `settings.locale.preference` (`zh*` → Chinese, anything else → English).
+- **Browser text** — the mode button's tooltip and accessible name — is
+  registered through the client locale service under the `context-rollover`
+  namespace, so the shell re-renders it on a language switch; a shell without
+  that service falls back to the document language.
+- **Model-facing text** — tool descriptions, the `new_context` refusal, the
+  guidance section, and the checkpoint body — stays English on purpose: it is
+  prompt surface, and the guidance section is part of the cached request prefix.
+
+### The session switch
+
+`/rollover` also carries the per-session choice, and one icon button in the
+session stats row (right end, beside the token counters) drives the same
+command. The icon *is* the state — a cycle arrow for rollover, a shrinking
+stack for standard compaction — and clicking it toggles:
+
+| Invocation | Effect |
+|---|---|
+| `/rollover on` (alias `rollover`) | this session uses rollover |
+| `/rollover off` (alias `compact`) | this session keeps its own compaction backend; the interceptor stands down for it |
+| `/rollover status` | report mode, thresholds, the session's backend, and whether the interceptor is active |
+| `/rollover` / `/rollover now` | start a new window immediately (rollover mode only) |
+
+The choice is per **session**, durable, and takes effect on the next step: it is
+recorded as that `/rollover` command's own `command/run` record — the session's
+existing, known event vocabulary — so the log stays readable by any DSH build
+and the choice survives reload, fork, and resume. The plugin publishes it as the
+`contextRolloverMode` session projection, which is what the switch reads; the
+switch writes by running the same command through the client command remote, so
+the UI adds no second source of truth. `preempt: false` in the plugin config is
+the global version of the same switch.
+
 ### Rollover paths
 
 1. **Model-driven** (preferred): the model saves notes, calls `new_context`
@@ -77,8 +156,9 @@ Responsibilities stay split (the Codex lesson):
    and rolling over.
 3. **Overflow**: a provider-confirmed `CONTEXT_WINDOW_EXCEEDED` forces a
    rollover with the same notes + tail checkpoint and retries the request.
-4. **Manual**: `/compact` keeps working — it performs the same standalone
-   notes + tail rollover on an idle agent.
+4. **Manual**: `/rollover now` starts a window immediately (the same standalone
+   notes + tail rollover), and `/compact` stays the session backend's own
+   command (a summary on an idle agent).
 
 Only the model-driven path carries a **handoff**. The engine never writes one
 for pressure, overflow, or manual rollovers: producing a handoff itself would
@@ -86,16 +166,70 @@ mean either an LLM summarization call or copying older user messages into the
 fresh window, and the second option revives stale requests. Those paths
 preserve intent through notes and the recent verbatim tail instead.
 
+### Interception and removability
+
+Two thresholds decide who acts first:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `thresholdRatio` (this plugin) | `0.75` | where rollover happens |
+| `compaction-basic.thresholdRatio` (any backend) | `0.8` (that package's default) | where a summary would happen |
+
+The plugin's default is deliberately below the stock backend's, because it
+intercepts compaction in *every* session rather than behind an opted-in
+composition. As long as this plugin's threshold is strictly lower, the rollover runs first
+and the backend never sees a prompt above its own threshold — this holds just
+as well for a backend owned by a preset realm, which is what makes the plugin
+preset-independent. If a deployment configures a backend lower (or a preset
+does), this plugin **stands down** for automatic pressure and overflow and logs
+exactly which two numbers decided that, once per backend. It does not silently
+summarize, and it does not silently double-act: `new_context` and
+`/rollover now` keep working in every configuration. Only the row that owns a
+session's policy speaks about it either: no controller injects a reminder
+computed from thresholds that session does not use.
+
+Honesty extends to the requests themselves: `new_context` answers
+`accepted: false` when the active context is already minimal (a checkpoint could
+not shrink what it would shadow, so no boundary can commit), and a
+model-requested rollover that a commit refuses is retried at the next boundary
+rather than dropped.
+
+That contract is what makes the plugin removable. Uninstalling it removes a
+listener and four tools; `ctx.compaction` never changed hands, no preset names
+this package, and every session — including ones created while the plugin was
+installed — keeps compacting through its own backend with no repair step. The
+same property makes the per-session switch cheap: `preempt: false` hands every
+automatic path back to the backend while the model-facing rollover stays
+available.
+
 ## What this plugin touches
 
-- **Registers four model-facing tools** (`new_context`, `get_context_remaining`, `notes`, `history`)
-  and one system-prompt section — on headless profiles in every session; on
-  the Web profile only inside `standard-rollover` sessions (other presets stay
-  exactly as shipped).
+- **Registers four model-facing tools** (`new_context`, `get_context_remaining`, `notes`, `history`),
+  one system-prompt section, and the human command `/rollover now` — in every
+  session of every preset, on every profile. The plugin is not opt-in per
+  preset; the switch is the plugin's own configuration (`preempt`), and a
+  per-session switch is future work.
+- **Ships one browser-side plugin** (`dsh.client`, `lib/client.js`): an icon
+  button in the session stats row that reads the `contextRolloverMode`
+  projection and runs `/rollover on|off` through the client's command remote.
+  It adds no host
+  route and no second state; if the shell cannot load it, the command and the
+  host half are unaffected. The browser half is authored as CommonJS against
+  the shell's module table and wrapped by `scripts/build-client.mjs` rather than
+  type-checked, because the shell's React types are not part of this package's
+  dependency closure.
 - **Writes files** in exactly one place: markdown notes under `<dsh home>/notes/<sessionId>/`.
   Nothing else on disk is written; no network calls, no telemetry.
-- **Replaces the active compaction backend** (`compaction-basic` is disabled by the bundle patch).
-  Session logs stay fully compatible in both directions.
+- **Adds an intercepting lifecycle layer**: an `agent/pre-step` listener
+  (registered with `prepend`), an `agent/turn-stopping` listener, an
+  `agent/request-error` listener, and an `agent/status` listener. The
+  session's compaction backend keeps its service, its identity, and its
+  threshold: the bundle patch inserts one row and changes no other. Session
+  logs stay fully compatible in both directions, and uninstalling leaves
+  nothing to repair.
+- **Adds no service and takes none away**: `ctx.compaction` still belongs to
+  the standard backend. `backend: true` opts an otherwise backend-less
+  deployment into this plugin providing it instead.
 - **No credentials, no cloud services, no data leaves the machine.**
 
 ## Host version compatibility
@@ -153,46 +287,43 @@ runtime after an install from Git Bash, pnpm may have materialized broken
 `cmd /c mklink /J` as described in the HMR section below — the same fix
 applies to any linked sibling package in the profile.
 
-The bundle's `cordis.patch.yml` disables `dsh-compaction-basic` and mounts the
-`context-rollover` engine itself. `command-compact`, the token meter, and the
-compaction invariant companions need no changes — they depend only on
+The bundle's `cordis.patch.yml` inserts one row (`context-rollover`) and
+changes nothing else: it never disables a compactor, never retunes one, and
+never edits `agent-presets`. `command-compact`, the token meter, and the
+compaction invariant companions need no changes — they still depend only on
 `ctx.compaction`.
 
-### Web profiles (preset sessions)
+### Every session, presets included
 
-Headless and other base-only profiles are done after the install above: the
-host engine *is* the session's engine, no roster exists, and nothing stands
-down. The Web profile is different — its sessions compose compaction from
-their **agent preset**, not from the host — so the bundle additionally
-registers a shipped `standard-rollover` preset ("Standard + rollover
-(experimental)" in the picker) beside the deployment's own set. Restart the
-host once after install, then open **new** sessions on it to try the
-experiment; `standard` stays the default. Existing sessions stay on whatever
-they started with.
+Nothing else is required after the install: restart once and the plugin
+intercepts compaction in every session, on every profile.
 
-No commands, no profile edits. Two behaviors make that hold:
+- On base-only/headless profiles the host-plane `compaction-basic` is the
+  session's backend, and the plugin's earlier pressure point wins (`0.75` vs
+  the backend's `0.8`).
+- On the **Web** profile the `dsh-web-app` layer keeps the host-plane
+  compaction rows disabled by design — sessions compose compaction from their
+  **agent preset** instead. The plugin's listeners are untagged, so they
+  receive those sessions' events anyway, and it reads the *preset's* backend
+  through the roster to compare thresholds. A `standard` (or `minimal`, or
+  `ptc`) session therefore rolls over exactly like a headless one, with no
+  preset to pick and no per-session setup.
+- If a deployment runs a backend whose threshold is earlier than the plugin's,
+  the plugin stands down for automatic pressure/overflow and logs the two
+  numbers; `new_context` and `/rollover now` keep working.
 
-- The host engine **defers to any preset-owned backend**: on a `standard`
-  session the shipped summarizer runs alone (previously the two backends
-  raced each pressure signal); on `standard-rollover` the preset's rollover
-  engine runs alone; headless sessions keep the host engine.
-- The preset's engine row sets `modelSurface: 'always'`, so it is the only
-  source of rollover tools and guidance in its sessions. On preset
-  deployments the host row (`modelSurface: 'auto'`) registers neither, so
-  `standard` and `minimal` sessions never see rollover-framed instructions.
+The `standard-rollover` preset id is retained as a **legacy shim only**: it is
+a verbatim copy of the shipped `standard` composition, contains no row from
+this package, and exists so sessions created during the earlier preset-based
+experiment still resolve their recorded preset and resume (the host row
+intercepts them like any other). Deployments with no such sessions can drop
+the bundle's `agent-presets` patch entry, or delete the preset directory; the
+plugin keeps working either way.
 
-Custom thresholds belong to your own preset copy (the supported customization
-flow: copy `standard-rollover` in the picker and edit the `context-rollover`
-row) — the shipped preset carries the defaults below. If a deployment
-restates the whole `agent-presets` config in a later patch layer, that layer
-wins and hides the shipped preset; re-adding the bundle's root there
-restores it. Uninstalling the bundle removes the preset: sessions already on
-it keep running, new ones must pick another preset.
-
-Maintainers: `presets/standard-rollover/` is generated, not authored —
-re-run `pnpm preset:sync` after harness updates and commit the refresh. The
-sync keeps everything else byte-identical and fails loud when the shipped
-`standard` shape drifts.
+Maintainers: `presets/standard-rollover/` is generated, not authored — re-run
+`pnpm preset:sync` after harness updates and commit the refresh. The sync
+copies the shipped `standard` composition verbatim and rewrites only the shim's
+metadata.
 
 Configuration (cordis.yml `config` on the plugin row):
 
@@ -201,15 +332,16 @@ Configuration (cordis.yml `config` on the plugin row):
     - id: context-rollover
       name: dsh-context-rollover
       config:
-        thresholdRatio: 0.9          # automatic rollover point (fraction of window)
-        reminderThresholdRatio: 0.75 # one-time checkpoint reminder point
+        thresholdRatio: 0.75         # automatic rollover point (fraction of window)
+        reminderThresholdRatio: 0.6  # one-time checkpoint reminder point
         retainRatio: 0.1             # recent verbatim tail (fraction of window)
         retainTokens: null           # absolute tail budget; overrides retainRatio
         handoffMaxChars: 20000
         notesEnabled: true
         historyEnabled: true
         notesDir: null               # base dir override; default <dsh home>/notes
-        modelSurface: auto           # auto (host rows) | always (preset rows)
+        preempt: true                # false: let the session's backend own automation
+        backend: false               # true: replace ctx.compaction (only where it is unprovided)
 ```
 
 ## Local development with HMR
@@ -339,6 +471,10 @@ Two differences from a plain checkout, both local-only:
   known event types (`compaction/*`, `user/message`) are written.
 - The generic `<compaction>` checkpoint provenance is reused, so transcript UIs
   recognize rollover checkpoints like any compaction.
+- Automatic preemption is a threshold contract, not exclusivity: a mounted
+  backend that fires at or before this plugin's threshold wins, and the plugin
+  stands down for automatic paths (with one warning naming both numbers).
+  `new_context` and `/rollover now` are unaffected by that ordering.
 - No DSH core was forked or patched; the plugin only consumes public seams.
 
 ## License

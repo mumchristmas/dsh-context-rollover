@@ -172,7 +172,7 @@ describe('rollover at the turn-stop boundary', () => {
     session.append('step/end', { turn: 7, step: 1 })
     // Turn 7 stays open: this is the stop boundary under test.
     const fakeAgent = { session, options: {} } as Agent
-    const pending = (engine as unknown as {
+    const pending = (engine.controller as unknown as {
       pendingRollovers: Map<string, { handoff: string | null }>
     }).pendingRollovers
     pending.set(session.id, { handoff: 'stop here' })

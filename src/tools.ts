@@ -8,11 +8,11 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import type { Context } from '@deepseek-ai/cordis'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { ResolvedRolloverConfig } from './config.ts'
+import type { RolloverMode } from './mode.ts'
 import { readHistoryItem, searchHistory } from './history.ts'
 import { NotesStore } from './notes.ts'
 import { countRollovers, measuredPromptTokens, rolloverSummarySeqs } from './rollover.ts'
@@ -25,11 +25,16 @@ export interface RolloverToolDependencies {
   /** Pending rollover requests keyed by session id, owned by the engine. */
   readonly pendingRollovers: Map<string, PendingRollover>
   /**
-   * Whether another backend owns compaction for an agent's session (a preset
-   * session reaching this host-registered tool). The engine wires its own
-   * ownership check here so `new_context` stays honest everywhere.
+   * Whether the session currently has a span worth replacing. The controller
+   * wires its own range check here so `new_context` never promises a boundary
+   * the commit would then refuse.
    */
-  readonly compactionOwnedElsewhere: (agent: { ctx: Context }) => boolean
+  readonly canRollOver: (session: Session) => boolean
+  /**
+   * The session's context-management mode. A session switched to standard
+   * compaction gets no boundary from this tool, and is told why.
+   */
+  readonly modeOf: (session: Session) => RolloverMode
 }
 
 /** Require the session an execution is running for. */
@@ -71,7 +76,9 @@ function newContextTool(deps: RolloverToolDependencies) {
     description:
       'Start a new context window at the next safe boundary. Does not clear, reset, or otherwise affect '
       + 'environment state. Earlier conversation leaves the active context; durable notes, your handoff, '
-      + 'and a recent verbatim conversation tail carry over, and full history stays recoverable via history.',
+      + 'and a recent verbatim conversation tail carry over, and full history stays recoverable via history. '
+      + 'The boundary always starts before the next model request, whether or not another compaction backend '
+      + 'is mounted for this session.',
     parameters: {
       handoff: {
         type: 'string',
@@ -86,29 +93,28 @@ function newContextTool(deps: RolloverToolDependencies) {
         additionalProperties: false,
         properties: {
           accepted: { type: 'boolean', required: true },
+          reason: { type: 'string' },
         },
       },
       render: (_args, rawValue) => {
-        const value = rawValue as unknown as { accepted?: boolean }
+        const value = rawValue as unknown as { accepted?: boolean; reason?: string }
         return [{
           type: 'text',
-          text: value.accepted === false
-            ? 'No new context window will start: this session compacts through its agent preset, '
-            + 'not through context rollover. Open a new session on the standard-rollover preset to roll over; '
-            + 'notes and history keep working here.'
-            : 'A new context window will start without summarizing conversation history.',
+          text: value.accepted !== false
+            ? 'A new context window will start without summarizing conversation history.'
+            : value.reason === 'compact-mode'
+              ? 'No new context window will start: this session is set to standard compaction, so its own '
+              + 'backend will compact when it reaches that backend\'s threshold. Ask the human to run '
+              + '/rollover on (or switch the session control) to use rollover instead.'
+              : 'No new context window will start: the active context is already minimal, so there is '
+              + 'nothing to roll over yet. Keep working, and request the boundary again once real '
+              + 'conversation has accumulated.',
         }]
       },
     },
     isConcurrencySafe: () => false,
     async execute(args, exec) {
       const session = requireSession(exec)
-      // A preset-owned session reaches this host-registered tool only when
-      // the preset does not shadow it. Recording the request would promise a
-      // boundary the deferring engine never crosses, so answer honestly.
-      if (exec.agent !== undefined && deps.compactionOwnedElsewhere(exec.agent)) {
-        return { accepted: false }
-      }
       const handoff = args.handoff ?? null
       if (handoff !== null && handoff.length > deps.config.handoffMaxChars) {
         throw new Error(
@@ -116,6 +122,17 @@ function newContextTool(deps: RolloverToolDependencies) {
           + 'Save larger material to notes and shorten the handoff.',
         )
       }
+      // The session's own switch decides first: standard-compaction sessions
+      // never get a rollover boundary from this tool.
+      if (deps.modeOf(session) !== 'rollover') return { accepted: false, reason: 'compact-mode' }
+      // Then refuse honestly when there is nothing to shadow — a rollover whose
+      // checkpoint would be larger than the content it replaces cannot commit,
+      // and answering "accepted" would promise a boundary that never starts.
+      if (!deps.canRollOver(session)) return { accepted: false, reason: 'minimal' }
+      // The interceptor's own pre-step listener crosses this boundary before the
+      // next request, so the request is a promise this plugin can always keep —
+      // including on a session whose realm mounts an ordinary compaction
+      // backend, which this plugin only preempts rather than replaces.
       deps.pendingRollovers.set(session.id, { handoff })
       return { accepted: true }
     },
