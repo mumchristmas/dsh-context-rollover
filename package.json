@@ -26,6 +26,7 @@
   },
   "files": [
     "lib",
+    "assets",
     "cordis.patch.yml",
     "presets",
     "scripts/make-web-preset.mjs"

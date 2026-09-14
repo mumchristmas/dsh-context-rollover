@@ -32,6 +32,23 @@ that is already there — it preempts that backend, it does not replace it. No c
 no network calls, no telemetry; the only thing it writes are markdown notes under
 `<dsh home>/notes/<session id>/`.
 
+## Screenshots
+
+**The switch sits where you already look.** The icon in the session stats row *is* the
+state — a recycle mark means this session rolls over, a split square means it keeps its own
+compaction backend — and the tooltip spells out what the current mode does and what a click
+switches to.
+
+![The context-mode button and its tooltip](assets/context-mode-button.webp)
+
+**The knobs, with the arithmetic done for you.** The settings card edits the rollover and
+reminder thresholds and the retained tail, and reports the backend this session compacts
+through (`compaction @ 80%` here), so the rollover threshold can stay below it.
+
+<img src="assets/rollover-settings-card.webp" alt="The Context rollover settings card" width="620">
+
+*Screenshots show the Chinese UI; human-facing text follows the app's language.*
+
 ## Install
 
 ### Let an agent do it
