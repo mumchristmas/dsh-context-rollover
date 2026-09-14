@@ -11,22 +11,3 @@
     - id: context-rollover
       name: dsh-context-rollover
       config: {}
-
-# The `standard-rollover` preset is a legacy id kept only so sessions created
-# during the earlier preset-based experiment still resume: it is now a verbatim
-# copy of the shipped `standard` composition, with no row from this package, so
-# it behaves exactly like `standard` and is safe to delete once no session
-# records it. `baseUrl` is the profile directory at boot, which keeps the path
-# correct in every install layout (profile, link, and registry installs).
-# Profiles without a preset roster (headless) report one harmless loader
-# warning for the unmatched id and are otherwise unaffected. A deployment that
-# restates the whole `agent-presets` config in a later layer takes precedence
-# and simply hides this preset.
-- id: agent-presets
-  config:
-    default: standard
-    roots:
-      - path: !!js process.getBuiltinModule('node:url').fileURLToPath(new URL('node_modules/dsh-context-rollover/presets/', baseUrl))
-        trust: system
-    includeShippedRoot: true
-    includeUserRoot: true

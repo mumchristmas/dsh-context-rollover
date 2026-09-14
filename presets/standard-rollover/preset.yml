@@ -1,3 +1,0 @@
-name: Standard + rollover (legacy id)
-description: Kept only so sessions created during the preset-based experiment still resume. The plugin now intercepts compaction from the host plane in every session, so this preset composes the standard backend unchanged and adds nothing; safe to delete once no session records it.
-order: 2

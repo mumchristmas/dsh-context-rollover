@@ -1,7 +1,7 @@
 {
   "name": "dsh-context-rollover",
   "description": "Model-driven context-window rollover bundle for the DeepSeek Harness: fresh working context, durable model-managed notes, a small verbatim recent tail, and targeted history recovery — no summarization.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -27,9 +27,7 @@
   "files": [
     "lib",
     "assets",
-    "cordis.patch.yml",
-    "presets",
-    "scripts/make-web-preset.mjs"
+    "cordis.patch.yml"
   ],
   "dsh": {
     "bundle": {
@@ -45,7 +43,6 @@
   "scripts": {
     "generate:paths": "node scripts/generate-dsh-paths.mjs",
     "build": "node scripts/generate-dsh-build-paths.mjs && tsc -p tsconfig.build.json && node scripts/build-client.mjs",
-    "preset:sync": "node scripts/make-web-preset.mjs",
     "test": "node scripts/generate-dsh-paths.mjs && vitest run",
     "typecheck": "node scripts/generate-dsh-paths.mjs && tsc -p tsconfig.json",
     "prepack": "npm run build",
