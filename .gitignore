@@ -3,3 +3,7 @@ lib/
 tsconfig.dsh-paths.json
 tsconfig.build-paths.json
 tsconfig.compat-paths.json
+
+# Local working notes and scratch output
+audit/
+audit-workspace/
