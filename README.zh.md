@@ -54,12 +54,27 @@
 请把 dsh-context-rollover 的最新 release 附件下载到当前工作目录，并把它装进我的
 "<profile>" profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
 
-  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
-  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.2.tgz
+  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.2.tgz
 ```
 
 手工执行就是同样两条命令。因为插件组合变了，profile 需要重启一次；之后 **设置 → 插件配置**
 里的卡片和输入框下方的模式按钮，就是它已经生效的凭证。
+
+### 支持的 DSH 宿主线
+
+peer 范围接受本仓库实际构建并测试过的每一条线：
+
+| 线 | 版本 |
+|---|---|
+| 公开 compat 线（npm） | `0.0.1-rc.1` … `0.0.1-rc.5` |
+| 同级 checkout 的源码线 | `0.1.0-rc.x`、`0.1.5-rc.x` |
+
+每条范围都写成显式并集 —— `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0` —— 因为 semver
+只允许预发布版本满足「`[major, minor, patch]` 三元组本身也带预发布」的比较符。**新增一条宿主
+预发布线必须手工加进这个并集**；没有任何静态范围能接受任意靠后的三元组，`tests/metadata.spec.ts`
+同时钉住了已接受的线和这一限制。范围不带上限，所以未来的大版本会照常安装：与某条线的兼容性由
+「针对它构建并测试」确立，而不是由安装器决定。
 
 ## 怎么用
 
@@ -73,6 +88,12 @@
   之后保留。
 - **你能看到留下了什么。** 笔记就是 `<dsh home>/notes/<session id>/` 下的纯 markdown。
   随便读、随便改、随便留。
+
+笔记目录被当作一条边界，而不只是一个文件夹：笔记路径同时做**词法**与**物理**校验，所以放在
+里面的符号链接无法让一个合法的 `path=linked.md` 读到或覆盖目录外的文件；确实指向目录内的链接
+仍然可用。写入以原子方式替换文件；读不出来的笔记绝不会被当成空文件 —— 它会被报出来，而不是被
+覆盖。两条限制需要说明白：Node 没有 `openat`，解析与打开之间的竞态无法彻底消除；这是单机上的
+按会话目录，不是沙箱。
 
 滚动阈值、提醒阈值和保留尾部在 **Plugin configuration → Context rollover** 设置卡片里
 （默认 `thresholdRatio: 0.75`、`reminderThresholdRatio: 0.6`；保留尾部按 Token 编辑，

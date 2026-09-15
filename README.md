@@ -61,8 +61,8 @@ You already run DSH, so hand it to the agent in a session:
 Download the latest dsh-context-rollover release asset into this working directory and install
 it into my "<profile>" profile — from the release asset, not npm — then restart that profile:
 
-  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.1.tgz
-  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.1.tgz
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.2.tgz
+  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.2.tgz
 ```
 
 By hand it is the same two commands. The profile restarts once because its plugin
