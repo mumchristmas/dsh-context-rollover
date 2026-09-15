@@ -15,7 +15,7 @@
  * @module tests/preempt
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
@@ -29,6 +29,7 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { RolloverController, ContextRolloverEngine } from '../src/index.ts'
 import * as rolloverPlugin from '../src/index.ts'
 import { MODE_PROJECTION_KEY, sessionMode } from '../src/mode.ts'
+import { NotesStore } from '../src/notes.ts'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { RolloverConfig } from '../src/config.ts'
 import { ROLLOVER_PROVIDER, countRollovers } from '../src/rollover.ts'
@@ -467,6 +468,25 @@ describe('/rollover now', () => {
     expect(countRollovers(session)).toBe(1)
     expect(derivedTexts(session).join('\n')).toContain('reason: manual')
     expect(backendSummaries(session)).toBe(0)
+  })
+
+  it('reports a refused checkpoint as such, instead of blaming a busy agent', async () => {
+    const { registered, agent, session } = await commandHarness()
+    // Notes far larger than the span they would replace: a legal request the
+    // commit refuses on its own budget. The user must be told what to change,
+    // not sent away to retry because the agent looked busy.
+    vi.spyOn(NotesStore.prototype, 'renderAll').mockResolvedValueOnce('notes '.repeat(3300))
+    const result = await registered.get('rollover')?.handler({
+      commandId: CommandId('cmd-refused'),
+      agent,
+      rawInput: ' now',
+      attachments: [],
+      signal: new AbortController().signal,
+    })
+    expect(result?.kind).toBe('error')
+    expect(result?.text).toContain('would not be smaller')
+    expect(result?.text).not.toContain('not idle')
+    expect(countRollovers(session)).toBe(0)
   })
 
   it('rejects any other grammar with usage', async () => {

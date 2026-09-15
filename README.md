@@ -69,6 +69,23 @@ By hand it is the same two commands. The profile restarts once because its plugi
 composition changed; after that, the card under **Settings → Plugin configuration** and the
 mode button under the composer show you it is live.
 
+### Supported DSH host lines
+
+The peer ranges accept every line this repository is built and tested against:
+
+| Line | Versions |
+|---|---|
+| Public compat line (npm) | `0.0.1-rc.1` … `0.0.1-rc.5` |
+| Source line in the sibling checkout | `0.1.0-rc.x`, `0.1.5-rc.x` |
+
+Each range is written as an explicit union — `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0` —
+because semver only lets a prerelease satisfy a comparator whose `[major, minor, patch]`
+tuple also carries a prerelease. **A new host prerelease line has to be added to that union
+by hand**; no static range can accept an arbitrary later tuple, and
+`tests/metadata.spec.ts` pins both the accepted lines and that limit. The ranges carry no
+upper bound, so a future major version installs without complaint: compatibility with a
+line is established by building and testing against it, not by the installer.
+
 ## Use
 
 - **It works on its own.** At 75% of the window it rolls over using the notes and the
@@ -83,6 +100,14 @@ mode button under the composer show you it is live.
   choice is per session and survives reload, fork, and resume.
 - **You can read what survives.** Notes are plain markdown in
   `<dsh home>/notes/<session id>/`. Read them, correct them, keep them.
+
+The notes directory is treated as a boundary, not just a folder: note paths are validated
+lexically *and* physically, so a symlink placed inside it cannot make a legitimate
+`path=linked.md` read or overwrite a file outside it. Links that genuinely point inside stay
+usable. Writes replace a file atomically, and a note that cannot be read is never mistaken
+for an empty one — it is reported instead of being overwritten. Two limits are worth stating
+plainly: Node has no `openat`, so a race between resolution and open cannot be eliminated
+outright, and this is a per-session directory on one machine, not a sandbox.
 
 The rollover and reminder thresholds and the retained tail live in the **Plugin
 configuration → Context rollover** settings card (`thresholdRatio: 0.75`,

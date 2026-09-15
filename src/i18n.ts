@@ -44,6 +44,9 @@ export const HOST_DICTIONARIES: Readonly<Record<PluginLocale, Readonly<Record<st
     'manual.busy': 'Rollover is unavailable because a compaction is active, or the agent is not idle.',
     'manual.cancelled': 'Rollover cancelled.',
     'manual.failed': 'Rollover failed: {message}',
+    'manual.tooLarge': 'Rollover refused: the checkpoint (your notes) would not be smaller than the conversation it '
+      + 'replaces, so it would free no room. Shorten or consolidate the notes, lower retainRatio/retainTokens, or '
+      + 'keep working until more conversation has accumulated.',
     'status.mode': 'mode',
     'status.rolloverAt': 'rollover at',
     'status.reminderAt': 'reminder at',
@@ -72,6 +75,8 @@ export const HOST_DICTIONARIES: Readonly<Record<PluginLocale, Readonly<Record<st
     'manual.busy': '当前有压缩正在进行，或 agent 不处于空闲状态，暂时无法滚动归档。',
     'manual.cancelled': '滚动归档已取消。',
     'manual.failed': '滚动归档失败：{message}',
+    'manual.tooLarge': '滚动归档被拒绝：检查点（你的笔记）不会比它要替换的对话更小，因此腾不出空间。'
+      + '请精简或合并笔记、调低 retainRatio/retainTokens，或继续积累对话后再试。',
     'status.mode': '模式',
     'status.rolloverAt': '滚动归档阈值',
     'status.reminderAt': '提醒阈值',

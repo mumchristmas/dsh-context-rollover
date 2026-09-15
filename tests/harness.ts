@@ -247,8 +247,9 @@ export function usageResponse(text: string, inputTokens: number): StreamChunk[] 
 /**
  * {@link usageResponse} with an explicit output count.
  *
- * Window accounting has to ignore the previous response's output, so a case
- * that pins that behaviour needs to control the output size, not inherit the
+ * Pressure accounting keeps the previous response's output: that message stays
+ * on the surface and the next request carries it again, so a case that pins
+ * the reading needs to control the output size rather than inherit the
  * five-token default.
  */
 export function usageResponseWith(text: string, inputTokens: number, outputTokens: number): StreamChunk[] {

@@ -8,42 +8,108 @@
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { ResolvedRolloverConfig } from './config.ts'
 import type { RolloverMode } from './mode.ts'
 import { readHistoryItem, searchHistory } from './history.ts'
+import type { HistoryProvenance } from './history.ts'
 import { NotesStore } from './notes.ts'
 import { countRollovers, measuredPromptTokens, rolloverSummarySeqs } from './rollover.ts'
 import type { PendingRollover } from './state.ts'
 
+/** Why a model-requested boundary would not be kept. */
+export type BoundaryRefusal = 'compact-mode' | 'minimal' | 'checkpoint-too-large'
+
+/** The outcome of checking whether a requested boundary can actually commit. */
+export type BoundaryCheck = 'ok' | Exclude<BoundaryRefusal, 'compact-mode'>
+
 /** Runtime collaborators the tool bodies need. */
 export interface RolloverToolDependencies {
+  /**
+   * Live effective configuration. Read it on every use rather than capturing
+   * it: a settings-card edit must reach the next tool call without a restart,
+   * and a snapshot taken at registration time would keep serving the values
+   * the plugin row was mounted with.
+   */
   readonly config: ResolvedRolloverConfig
   readonly meter: TokenMeter
   /** Pending rollover requests keyed by session id, owned by the engine. */
   readonly pendingRollovers: Map<string, PendingRollover>
   /**
-   * Whether the session currently has a span worth replacing. The controller
-   * wires its own range check here so `new_context` never promises a boundary
-   * the commit would then refuse.
+   * Whether a rollover with this handoff would commit right now, judged on the
+   * same notes/handoff budget the commit itself uses. Answering "accepted" on a
+   * weaker check would promise a boundary the commit then refuses.
    */
-  readonly canRollOver: (session: Session) => boolean
+  readonly canRollOver: (session: Session, handoff: string | null) => Promise<BoundaryCheck>
   /**
    * The session's context-management mode. A session switched to standard
    * compaction gets no boundary from this tool, and is told why.
    */
   readonly modeOf: (session: Session) => RolloverMode
+  /**
+   * Whether automatic rollover is actually armed for this agent. A session in
+   * standard-compaction mode, or one whose own backend fires first, gets no
+   * automatic boundary — reporting a countdown toward one would be a fiction.
+   */
+  readonly automaticArmed: (agent: Agent) => boolean
+}
+
+/** Require the agent an execution is running for. */
+function requireAgent(exec: ToolRunContext): Agent {
+  const agent = exec.agent
+  if (agent === undefined) {
+    throw new Error('this tool requires an owning agent session')
+  }
+  return agent
+}
+
+/** Inclusive bounds for one numeric tool argument. */
+interface IntegerRange {
+  readonly min: number
+  readonly max: number
+}
+
+/** Bounds for the two search tools' match limits. */
+const MATCH_LIMIT: IntegerRange = { min: 0, max: 200 }
+
+/** Bounds for a history read's character limit. */
+const CHAR_LIMIT: IntegerRange = { min: 0, max: 200_000 }
+
+/** Bounds for a logged event seq. */
+const SEQ_LIMIT: IntegerRange = { min: 0, max: Number.MAX_SAFE_INTEGER }
+
+/**
+ * Validate one numeric tool argument at the boundary.
+ *
+ * The host has already established that the value is a finite number, so this
+ * is about the *meaning* of the bound. A negative, fractional, or absurd limit
+ * is not a smaller limit — it is a request the tool cannot honour — and
+ * coercing it silently would answer a different question than the one asked.
+ * @param value - the raw argument, or undefined when it was omitted.
+ * @param name - argument name, for the error text.
+ * @param range - inclusive bounds the value must fall inside.
+ * @returns the validated value, or undefined when the argument was omitted.
+ * @throws when the value is not an integer inside the range.
+ */
+function boundedInteger(value: unknown, name: string, range: IntegerRange): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new Error(
+      `${name} must be an integer between ${range.min} and ${range.max}, got ${String(value)}`,
+    )
+  }
+  if (value < range.min || value > range.max) {
+    throw new Error(`${name} must be between ${range.min} and ${range.max}, got ${value}`)
+  }
+  return value
 }
 
 /** Require the session an execution is running for. */
 function requireSession(exec: ToolRunContext): Session {
-  const session = exec.agent?.session
-  if (session === undefined) {
-    throw new Error('this tool requires an owning agent session')
-  }
-  return session
+  return requireAgent(exec).session
 }
 
 /** Resolve the notes store for one session. */
@@ -59,7 +125,9 @@ function notesStoreFor(config: ResolvedRolloverConfig, session: Session): NotesS
  * tail at a rollover, so this number can fall without any provider traffic.
  * `surface_tokens` is the part of that prompt the conversation itself
  * accounts for — the rest is the system prompt, the tool schemas, and the
- * per-step context DSH injects.
+ * per-step context DSH injects. `rollover_tokens_left` is null whenever no
+ * automatic rollover is armed for the session, so a countdown is never shown
+ * toward a boundary that will not come.
  */
 interface ContextRemainingResult {
   prompt_tokens: number | null
@@ -67,6 +135,28 @@ interface ContextRemainingResult {
   context_window: number | null
   prompt_tokens_left: number | null
   rollover_tokens_left: number | null
+}
+
+/** The model-facing answer for one `new_context` outcome. */
+function newContextAnswer(value: { accepted?: boolean; reason?: BoundaryRefusal }): string {
+  if (value.accepted !== false) {
+    return 'A new context window will start without summarizing conversation history.'
+  }
+  switch (value.reason) {
+    case 'compact-mode':
+      return 'No new context window will start: this session is set to standard compaction, so its own '
+        + 'backend will compact when it reaches that backend\'s threshold. Ask the human to run '
+        + '/rollover on (or switch the session control) to use rollover instead.'
+    case 'checkpoint-too-large':
+      return 'No new context window will start: the checkpoint (durable notes plus this handoff) would be '
+        + 'no smaller than the conversation it would replace, so starting a window now would free no room. '
+        + 'Trim the handoff, shorten or consolidate the notes, or keep working until more conversation has '
+        + 'accumulated, then ask again.'
+    default:
+      return 'No new context window will start: the active context is already minimal, so there is '
+        + 'nothing to roll over yet. Keep working, and request the boundary again once real '
+        + 'conversation has accumulated.'
+  }
 }
 
 /** The `new_context` tool: request a context boundary at the next safe point. */
@@ -96,21 +186,10 @@ function newContextTool(deps: RolloverToolDependencies) {
           reason: { type: 'string' },
         },
       },
-      render: (_args, rawValue) => {
-        const value = rawValue as unknown as { accepted?: boolean; reason?: string }
-        return [{
-          type: 'text',
-          text: value.accepted !== false
-            ? 'A new context window will start without summarizing conversation history.'
-            : value.reason === 'compact-mode'
-              ? 'No new context window will start: this session is set to standard compaction, so its own '
-              + 'backend will compact when it reaches that backend\'s threshold. Ask the human to run '
-              + '/rollover on (or switch the session control) to use rollover instead.'
-              : 'No new context window will start: the active context is already minimal, so there is '
-              + 'nothing to roll over yet. Keep working, and request the boundary again once real '
-              + 'conversation has accumulated.',
-        }]
-      },
+      render: (_args, rawValue) => [{
+        type: 'text',
+        text: newContextAnswer(rawValue as unknown as { accepted?: boolean; reason?: BoundaryRefusal }),
+      }],
     },
     isConcurrencySafe: () => false,
     async execute(args, exec) {
@@ -125,10 +204,11 @@ function newContextTool(deps: RolloverToolDependencies) {
       // The session's own switch decides first: standard-compaction sessions
       // never get a rollover boundary from this tool.
       if (deps.modeOf(session) !== 'rollover') return { accepted: false, reason: 'compact-mode' }
-      // Then refuse honestly when there is nothing to shadow — a rollover whose
-      // checkpoint would be larger than the content it replaces cannot commit,
-      // and answering "accepted" would promise a boundary that never starts.
-      if (!deps.canRollOver(session)) return { accepted: false, reason: 'minimal' }
+      // Then refuse honestly when the boundary could not actually commit. The
+      // check runs the commit's own notes/handoff budget, so "accepted" is a
+      // promise this tool can keep rather than one the commit later breaks.
+      const check = await deps.canRollOver(session, handoff)
+      if (check !== 'ok') return { accepted: false, reason: check }
       // The interceptor's own pre-step listener crosses this boundary before the
       // next request, so the request is a promise this plugin can always keep —
       // including on a session whose realm mounts an ordinary compaction
@@ -166,16 +246,23 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
         if (value.prompt_tokens_left !== null) lines.push(`window left   ${num(value.prompt_tokens_left)}`)
         if (value.rollover_tokens_left !== null) {
           lines.push(`rollover in   ${num(value.rollover_tokens_left)}`)
+        } else {
+          lines.push('rollover      off: automatic rollover does not run for this session')
         }
         return [{ type: 'text', text: lines.join('\n') }]
       },
     },
     async execute(_args, exec) {
-      const session = requireSession(exec)
+      const agent = requireAgent(exec)
+      const session = agent.session
       const contextWindow = session.requestContext()?.contextWindow ?? null
       const thresholdTokens = contextWindow === null
         ? null
         : Math.floor(contextWindow * deps.config.thresholdRatio)
+      // A countdown only means something where automatic rollover is armed: a
+      // session in standard-compaction mode, or one whose own backend fires at
+      // or before this threshold, never crosses this plugin's boundary.
+      const armed = deps.automaticArmed(agent)
       const measurement = deps.meter.measure(session)
       const promptTokens = measuredPromptTokens(measurement)
       return {
@@ -185,7 +272,7 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
         prompt_tokens_left: contextWindow === null || promptTokens === null
           ? null
           : Math.max(0, contextWindow - promptTokens),
-        rollover_tokens_left: thresholdTokens === null || promptTokens === null
+        rollover_tokens_left: !armed || thresholdTokens === null || promptTokens === null
           ? null
           : Math.max(0, thresholdTokens - promptTokens),
       }
@@ -222,7 +309,7 @@ function notesTool(deps: RolloverToolDependencies) {
       },
       max_matches: {
         type: 'number',
-        description: 'Maximum matches returned by search (default 20).',
+        description: `Maximum matches returned by search (default 20, 0..${MATCH_LIMIT.max}; 0 returns none).`,
       },
     },
     output: {
@@ -265,7 +352,8 @@ function notesTool(deps: RolloverToolDependencies) {
         }
         case 'search': {
           if (args.query === undefined) throw new Error('search requires "query"')
-          const matches = await store.search(args.query, args.max_matches ?? 20)
+          const maxMatches = boundedInteger(args.max_matches, 'max_matches', MATCH_LIMIT) ?? 20
+          const matches = await store.search(args.query, maxMatches)
           if (matches.length === 0) return { action: 'search', text: 'No matches.' }
           return {
             action: 'search',
@@ -279,6 +367,17 @@ function notesTool(deps: RolloverToolDependencies) {
       }
     },
   })
+}
+
+/**
+ * Label one history item's origin, naming the producer when the item is not
+ * direct human text, so a collaborator's report is never read as the human's
+ * own words.
+ */
+function originLabel(item: { readonly kind: string; readonly provenance?: HistoryProvenance }): string {
+  if (item.provenance === undefined) return item.kind
+  const from = item.provenance.senderSessionId
+  return `${item.kind}: ${item.provenance.source}${from === undefined ? '' : ` from ${from}`}`
 }
 
 /** The `history` tool: targeted recovery of conversation that left the active surface. */
@@ -305,11 +404,12 @@ function historyTool() {
       },
       max_matches: {
         type: 'number',
-        description: 'Maximum matches returned by search (default 10).',
+        description: `Maximum matches returned by search (default 10, 0..${MATCH_LIMIT.max}; 0 returns none).`,
       },
       max_chars: {
         type: 'number',
-        description: 'Maximum characters returned by read (default 4000).',
+        description: `Maximum characters returned by read (default 4000, 0..${CHAR_LIMIT.max}; `
+          + '0 returns the item header with no body).',
       },
     },
     output: {
@@ -332,29 +432,31 @@ function historyTool() {
             windowCount,
             rolloverSeqs,
             args.query,
-            args.max_matches ?? 10,
+            boundedInteger(args.max_matches, 'max_matches', MATCH_LIMIT) ?? 10,
           )
           if (matches.length === 0) return { action: 'search', text: 'No matches in history.' }
           return {
             action: 'search',
             text: matches
-              .map(match => `[seq ${match.seq}] (window ${match.window}, ${match.kind}) ${match.snippet}`)
+              .map(match => `[seq ${match.seq}] (window ${match.window}, ${originLabel(match)}) ${match.snippet}`)
               .join('\n---\n'),
           }
         }
         case 'read': {
-          if (args.seq === undefined) throw new Error('read requires "seq"')
+          const seq = boundedInteger(args.seq, 'seq', SEQ_LIMIT)
+          if (seq === undefined) throw new Error('read requires "seq"')
           const item = readHistoryItem(
             session,
-            args.seq,
+            seq,
             windowCount,
             rolloverSeqs,
-            args.max_chars ?? 4000,
+            boundedInteger(args.max_chars, 'max_chars', CHAR_LIMIT) ?? 4000,
           )
           if (item === null) {
-            throw new Error(`no history item at seq ${args.seq} (it may still be on the active surface)`)
+            throw new Error(`no history item at seq ${seq} (it may still be on the active surface)`)
           }
-          return { action: 'read', text: `[seq ${item.seq}] (window ${item.window}, ${item.kind})\n${item.text}` }
+          const header = `[seq ${item.seq}] (window ${item.window}, ${originLabel(item)})`
+          return { action: 'read', text: item.text.length === 0 ? header : `${header}\n${item.text}` }
         }
         default:
           throw new Error(`unknown history action "${String(args.action)}"; expected search or read`)
@@ -364,7 +466,35 @@ function historyTool() {
 }
 
 /**
- * Build the plugin's tools for one engine instance.
+ * Build the tools that are always mounted for one engine instance.
+ * @param deps - runtime collaborators shared with the engine.
+ * @returns the always-mounted tool definitions.
+ */
+export function createCoreRolloverTools(deps: RolloverToolDependencies): ToolDefinition[] {
+  return [newContextTool(deps), getContextRemainingTool(deps)]
+}
+
+/**
+ * Build the optional tools one effective configuration enables.
+ *
+ * These are mounted and unmounted as the settings change, so a disabled tool
+ * is genuinely absent from the model's surface rather than merely refusing.
+ * @param deps - runtime collaborators shared with the engine.
+ * @param enabled - which optional tools the effective configuration enables.
+ * @returns the optional tool definitions to register.
+ */
+export function createOptionalRolloverTools(
+  deps: RolloverToolDependencies,
+  enabled: { readonly notes: boolean; readonly history: boolean },
+): ToolDefinition[] {
+  return [
+    ...(enabled.notes ? [notesTool(deps)] : []),
+    ...(enabled.history ? [historyTool()] : []),
+  ]
+}
+
+/**
+ * Build the plugin's whole tool surface for one engine instance.
  * @param deps - runtime collaborators shared with the engine.
  * @param notesEnabled - whether the `notes` tool is mounted.
  * @param historyEnabled - whether the `history` tool is mounted.
@@ -375,11 +505,8 @@ export function createRolloverTools(
   notesEnabled: boolean,
   historyEnabled: boolean,
 ): ToolDefinition[] {
-  const tools = [
-    newContextTool(deps),
-    getContextRemainingTool(deps),
-    ...(notesEnabled ? [notesTool(deps)] : []),
-    ...(historyEnabled ? [historyTool()] : []),
+  return [
+    ...createCoreRolloverTools(deps),
+    ...createOptionalRolloverTools(deps, { notes: notesEnabled, history: historyEnabled }),
   ]
-  return tools
 }

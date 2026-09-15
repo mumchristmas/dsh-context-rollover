@@ -1,15 +1,17 @@
 /**
  * Window-pressure accounting: what the plugin compares against the context
- * window, and why it is not `TokenMeasurement.totalTokens`.
+ * window.
  *
- * The meter anchors a completed call with `usageTokens(usage)`, which sums the
- * call's prompt **and its output**. The next request carries the prompt only,
- * so the raw total over-reports every window by one assistant response —
- * measured live at 2,000–5,100 tokens on a 32k test window (6–16%), enough to
- * fire the reminder and the automatic rollover a whole response early.
+ * The meter anchors a completed call with `usageTokens(usage)`, which sums that
+ * call's prompt **and its output**. That output is not discarded: the assistant
+ * message stays on the active surface and the next request replays the
+ * conversation in full, so the whole total is the honest projection of what the
+ * window has to hold. Subtracting the output would report every window one
+ * assistant response too small and fire the reminder and the automatic rollover
+ * late — the defect these tests exist to prevent from returning.
  *
- * `requestPressureTokens` subtracts exactly that output. These tests pin both
- * halves: the arithmetic, and a threshold decision that would flip without it.
+ * They pin both halves: the arithmetic, and the threshold decisions that depend
+ * on it.
  *
  * @module tests/pressure-accounting
  */
@@ -21,20 +23,18 @@ import {
   followup,
   reminderTexts,
   ScriptedAdapter,
-  toolCall,
-  usageResponse,
   usageResponseWith,
 } from './harness.ts'
 
 describe('pressure accounting', () => {
-  it('reports the next request prompt, not the prompt plus the last response', async () => {
+  it('reports the full reading the next request will carry', async () => {
     const { ctx, agent, session } = await engineHarness('prompt-only', {
       thresholdRatio: 0.9,
       reminderThresholdRatio: 0.75,
       retainTokens: 40,
     })
     // An honest provider reading of 30,000 prompt tokens plus a 5-token answer.
-    const adapter = new ScriptedAdapter([usageResponse('answer one', 30000)])
+    const adapter = new ScriptedAdapter([usageResponseWith('answer one', 30000, 5)])
     ctx.llm.registerAdapter(['mock'], adapter)
 
     await followup(agent, 'turn one')
@@ -42,62 +42,45 @@ describe('pressure accounting', () => {
 
     expect(measurement.baseline.kind).toBe('usage')
     expect(measurement.totalTokens).toBe(30005)
-    // The next request rebuilds the prompt from the surface: no 5 output
-    // tokens, so the window pressure is the prompt alone.
-    expect(requestPressureTokens(measurement)).toBe(30000)
+    // The previous answer is still on the surface and is replayed in full, so
+    // the window pressure is the whole reading, not the prompt alone.
+    expect(requestPressureTokens(measurement)).toBe(30005)
   })
 
-  it('decides the automatic rollover on the prompt, not on the raw total', async () => {
-    // Control: prompt 85,000 with an 8,000-token answer. The raw total
-    // (93,000) is past the 90,000 rollover point, the prompt is not. Counting
-    // the previous response's output — what `totalTokens` reports — would roll
-    // over here; the corrected reading must not.
-    const naive = await engineHarness('prompt-vs-total-naive', {
+  it('rolls over once the last response leaves the next request past the threshold', async () => {
+    const { ctx, agent, session } = await engineHarness('prompt-vs-total', {
       thresholdRatio: 0.9,
       reminderThresholdRatio: 0.75,
       retainTokens: 0,
     })
-    naive.ctx.llm.registerAdapter(['mock'], new ScriptedAdapter([
+    // A first request large enough that the boundary has real content to
+    // shadow, answered with 8,000 tokens on top of an 85,000-token prompt.
+    const adapter = new ScriptedAdapter([
       usageResponseWith(`answer one ${'detail '.repeat(400)}`, 85000, 8000),
-      toolCall('get_context_remaining', '{}', 'c1'),
       usageResponseWith(`answer two ${'detail '.repeat(400)}`, 86000, 8000),
       usageResponseWith(`answer three ${'detail '.repeat(400)}`, 87000, 8000),
-    ]))
-    await followup(naive.agent, 'turn one')
-    const naiveReading = naive.ctx.tokenMeter.measure(naive.session)
-    expect(naiveReading.totalTokens).toBeGreaterThanOrEqual(90000)
-    expect(requestPressureTokens(naiveReading)).toBeLessThan(90000)
+    ])
+    ctx.llm.registerAdapter(['mock'], adapter)
 
-    await followup(naive.agent, 'turn two')
-    expect(countRollovers(naive.session)).toBe(0)
+    await followup(agent, `turn one ${'context '.repeat(400)}`)
+    const measurement = ctx.tokenMeter.measure(session)
+    expect(measurement.baseline.kind).toBe('usage')
+    expect(measurement.totalTokens).toBe(93_000)
+    // 93,000 is past the 90,000 rollover point, and the next request genuinely
+    // carries both halves. A reader that subtracted the answer would see
+    // 85,000 and let another unrolled request through.
+    expect(requestPressureTokens(measurement)).toBe(93_000)
 
-    // Genuine case: a prompt past the rollover point still rolls over, exactly
-    // once, so the correction cannot silently disable the safety net.
-    const real = await engineHarness('prompt-vs-total-real', {
-      thresholdRatio: 0.9,
-      reminderThresholdRatio: 0.75,
-      retainTokens: 0,
-    })
-    real.ctx.llm.registerAdapter(['mock'], new ScriptedAdapter([
-      usageResponse(`answer one ${'detail '.repeat(400)}`, 85000),
-      toolCall('get_context_remaining', '{}', 'c1'),
-      usageResponse(`answer two ${'detail '.repeat(400)}`, 95000),
-      usageResponse(`answer three ${'detail '.repeat(400)}`, 96000),
-    ]))
-    await followup(real.agent, 'turn one')
-    await followup(real.agent, 'turn two')
-    // Turn two's reading was still the pre-rollover prompt; the rollover lands
-    // on the next turn's pre-step, where 95,000 is visible.
-    expect(countRollovers(real.session)).toBe(0)
-    await followup(real.agent, 'turn three')
-    expect(countRollovers(real.session)).toBe(1)
+    // The boundary is crossed before the next request, not one response later.
+    await followup(agent, 'turn two')
+    expect(countRollovers(session)).toBe(1)
   })
 
-  it('reports the reminder against the prompt, not the raw total', async () => {
+  it('reports the reminder against that same reading', async () => {
     const { ctx, agent, session } = await engineHarness('reminder-accounting', {
-      // Reminder point 22,500 of the 100k window. The honest reading is a
-      // 25,000-token prompt plus a 4,000-token answer: counting the output
-      // would report 29% used, the prompt is 25%.
+      // Reminder point 22,500 of the 100k window. The reading after turn one is
+      // a 25,000-token prompt plus its 4,000-token answer: 29,000, i.e. 29% of
+      // the window once the answer the next request replays is counted.
       thresholdRatio: 0.9,
       reminderThresholdRatio: 0.225,
       retainTokens: 40,
@@ -114,9 +97,8 @@ describe('pressure accounting', () => {
     expect(reminders).toHaveLength(1)
     // The reminder leads with the numbers and labels them the same way the
     // tool does: the prompt the next request would submit, out of the window.
-    expect(reminders[0]).toContain('prompt used 25,000 / 100,000')
-    expect(reminders[0]).toContain('window left 75,000')
-    expect(reminders[0]).toContain('automatic rollover in 65,000')
-    expect(reminders[0]).not.toContain('29,000')
+    expect(reminders[0]).toContain('prompt used 29,000 / 100,000')
+    expect(reminders[0]).toContain('window left 71,000')
+    expect(reminders[0]).toContain('automatic rollover in 61,000')
   })
 })

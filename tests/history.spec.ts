@@ -11,7 +11,10 @@ import { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import { Session } from '@deepseek-ai/dsh-session'
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+// Load the host's merge-extensible message-source kinds (`agent-message`,
+// `subagent-settled`) so the collaborating-agent fixtures below typecheck.
+import type {} from '@deepseek-ai/dsh-subagent'
 import { collectHistory, readHistoryItem, searchHistory } from '../src/history.ts'
 import { commitRollover, countRollovers, rolloverSummarySeqs, selectRolloverRange } from '../src/rollover.ts'
 import { appendExchange, closedConversation } from './harness.ts'
@@ -180,5 +183,89 @@ describe('history', () => {
       .find(event => JSON.stringify(event.data).includes('reminder marker xyz'))
     if (notice === undefined) throw new Error('expected the reminder event in the log')
     expect(readHistoryItem(session, notice.seq, windowCount, rolloverSeqs)).toBeNull()
+  })
+
+  it('recovers tool result bodies and tool call arguments', async () => {
+    const session = closedConversation(4)
+    await rollEverything(session, 1)
+
+    const windowCount = countRollovers(session)
+    const rolloverSeqs = rolloverSummarySeqs(session)
+
+    // The tool output is the content the model actually read, so it is the
+    // thing history exists to give back — a `[tool-result]` marker is not it.
+    const bodyHits = searchHistory(session, windowCount, rolloverSeqs, 'result: exchange 1')
+    expect(bodyHits.length).toBeGreaterThan(0)
+    expect(bodyHits[0]?.kind).toBe('tool-result')
+
+    // The call's name and raw JSON arguments are recoverable too.
+    const callHits = searchHistory(session, windowCount, rolloverSeqs, 'demo_tool')
+    expect(callHits.length).toBeGreaterThan(0)
+    expect(callHits[0]?.kind).toBe('assistant')
+
+    const resultEvent = session.snapshotEvents().find(event => event.type === 'tool/result')
+    if (resultEvent === undefined) throw new Error('expected a tool result in the fixture')
+    const resultItem = readHistoryItem(session, resultEvent.seq, windowCount, rolloverSeqs)
+    expect(resultItem?.text).toContain('result: exchange 1')
+    expect(resultItem?.text).toContain('tool-result')
+
+    const callEvent = session.snapshotEvents()
+      .filter(event => event.type === 'assistant/message')
+      .find(event => JSON.stringify(event.data).includes('demo_tool'))
+    if (callEvent === undefined) throw new Error('expected an assistant tool call in the fixture')
+    const callItem = readHistoryItem(session, callEvent.seq, windowCount, rolloverSeqs)
+    expect(callItem?.text).toContain('demo_tool')
+    expect(callItem?.text).toContain('{"x":1}')
+  })
+
+  it('recovers messages other agents sent this session, with their provenance', async () => {
+    const session = closedConversation(2)
+    const relay = session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'relay-unique-marker' }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: SessionId('child-session') },
+    }), { surfaceOp: 'append' })
+    const settled = session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'child-final-report-unique-marker' }],
+      source: {
+        kind: 'subagent-settled',
+        form: 'notice',
+        summary: 'Child finished',
+        senderSessionId: SessionId('child-session'),
+      },
+    }), { surfaceOp: 'append' })
+    // Later conversation pushes both off the retained tail so the rollover
+    // genuinely shadows them.
+    appendExchange(session, 3, 'exchange 3', false)
+    await rollEverything(session, 1)
+
+    const windowCount = countRollovers(session)
+    const rolloverSeqs = rolloverSummarySeqs(session)
+
+    const relayHits = searchHistory(session, windowCount, rolloverSeqs, 'relay-unique-marker')
+    expect(relayHits).toHaveLength(1)
+    expect(relayHits[0]?.kind).toBe('agent')
+    expect(relayHits[0]?.provenance).toMatchObject({
+      source: 'agent-message',
+      form: 'relay',
+      senderSessionId: 'child-session',
+    })
+
+    const relayItem = readHistoryItem(session, relay.seq, windowCount, rolloverSeqs)
+    expect(relayItem?.text).toContain('relay-unique-marker')
+    expect(relayItem?.kind).toBe('agent')
+
+    // A settlement report is model-visible context, and it is credited to the
+    // runtime that wrote it rather than presented as the human's words.
+    const settledHits = searchHistory(session, windowCount, rolloverSeqs, 'child-final-report-unique-marker')
+    expect(settledHits).toHaveLength(1)
+    expect(settledHits[0]?.provenance).toMatchObject({
+      source: 'subagent-settled',
+      form: 'notice',
+      summary: 'Child finished',
+      senderSessionId: 'child-session',
+    })
+    const settledItem = readHistoryItem(session, settled.seq, windowCount, rolloverSeqs)
+    expect(settledItem?.kind).toBe('agent')
+    expect(settledItem?.text).toContain('child-final-report-unique-marker')
   })
 })

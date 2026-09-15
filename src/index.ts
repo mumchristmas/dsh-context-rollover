@@ -40,6 +40,7 @@ import type { Seq } from './compat.ts'
 import { Config as rolloverConfigSchema, resolveConfig } from './config.ts'
 import type { RolloverConfig, ResolvedRolloverConfig } from './config.ts'
 import type { RolloverReason } from './checkpoint.ts'
+import { buildCheckpointText } from './checkpoint.ts'
 import { CONTEXT_MANAGEMENT_GUIDANCE } from './guidance.ts'
 import { NotesStore } from './notes.ts'
 import { sessionEventAt } from './compat.ts'
@@ -48,10 +49,14 @@ import {
   commitRollover,
   countRollovers,
   measuredPromptTokens,
+  priceCheckpoint,
   REMINDER_SUMMARY_PREFIX,
+  RolloverRefusedError,
   selectRolloverRange,
+  spanSurfaceNodes,
 } from './rollover.ts'
-import { createRolloverTools } from './tools.ts'
+import { createCoreRolloverTools, createOptionalRolloverTools } from './tools.ts'
+import type { BoundaryCheck, RolloverToolDependencies } from './tools.ts'
 import {
   modeFromArgument,
   modeProjectionDefinition,
@@ -143,6 +148,28 @@ function concreteCompaction(engine: CompactionEngine): CompactionEngine {
   return (engine as CompactionEngine & { [symbols.original]?: CompactionEngine })[symbols.original] ?? engine
 }
 
+/**
+ * Cross-module brand marking a compaction backend as this plugin's engine.
+ *
+ * `instanceof` only recognizes this module copy's constructor, and the Web
+ * profile deliberately loads this module through two different paths — the
+ * host bundle row and the agent-preset row sit behind separate realms. A
+ * global symbol is readable from every copy, so one row recognizes the other's
+ * engine instead of mistaking it for a foreign backend and preempting a
+ * session that plugin already owns.
+ */
+const ENGINE_BRAND = Symbol.for('dsh.context-rollover.backend')
+
+/**
+ * Whether a backend is this plugin's rollover engine, from any module copy.
+ * @param engine - one resolved compaction backend.
+ * @returns true when the backend is a rollover engine.
+ */
+function isRolloverEngine(engine: CompactionEngine): boolean {
+  if (engine instanceof ContextRolloverEngine) return true
+  return (engine as unknown as Record<symbol, unknown>)[ENGINE_BRAND] === true
+}
+
 /** Minimal shape of the human-command registry this plugin contributes to. */
 interface CommandRegistry {
   register(definition: {
@@ -189,8 +216,17 @@ export class RolloverController {
   private readonly warnedBackends = new Set<string>()
   /** Human-facing text in the deployment's current language. */
   private readonly t: (key: string, values?: Readonly<Record<string, string | number>>) => string
-  /** Backends resolved for a session, in first-seen order: the card's input. */
-  private readonly observedBackends = new Map<string, BackendObservation>()
+  /**
+   * Backends resolved for a session, keyed by the resolved instance itself.
+   * Two presets may both publish a backend called `compaction` at different
+   * thresholds; keying by name would let the later, looser one erase the
+   * stricter one and make the card report an unsafe bound.
+   */
+  private readonly observedBackends = new Map<CompactionEngine, BackendObservation>()
+  /** Disposers for the optional tools the current configuration mounts. */
+  private readonly optionalToolDisposers: Array<() => void> = []
+  /** Tool collaborators, retained so a settings change can remount the optionals. */
+  private toolDeps: RolloverToolDependencies | undefined
 
   /**
    * @param ctx - context owning every registration this controller makes.
@@ -211,7 +247,12 @@ export class RolloverController {
     this.registerModeProjection()
     this.registerCommand()
     this.registerLifecycle()
-    installSettings(ctx, this.rowConfig, (effective) => { this.effective = effective })
+    installSettings(ctx, this.rowConfig, (effective) => {
+      this.effective = effective
+      // The optional tool surface follows the same effective configuration the
+      // thresholds do, so a card toggle reaches the model without a restart.
+      this.syncOptionalTools()
+    })
     registerBackendRoute(ctx, () => this.backendReport())
   }
 
@@ -223,15 +264,48 @@ export class RolloverController {
    * rather than behind an opted-in composition.
    */
   private registerTools(): void {
-    const deps = {
-      config: this.config,
+    const controller = this
+    const deps: RolloverToolDependencies = {
+      // A getter, not a snapshot. `registerTools` runs before
+      // `installSettings`, so a captured value would freeze the row config and
+      // a card edit would never reach the tools.
+      get config() { return controller.effective },
       meter: this.ctx.tokenMeter,
       pendingRollovers: this.pendingRollovers,
-      canRollOver: (session: Session) => this.canRollOver(session),
-      modeOf: (session: Session) => sessionMode(session),
+      canRollOver: (session, handoff) => this.checkBoundary(session, handoff),
+      modeOf: session => sessionMode(session),
+      automaticArmed: agent => this.shouldPreemptAutomatic(agent),
     }
-    for (const tool of createRolloverTools(deps, this.config.notesEnabled, this.config.historyEnabled)) {
+    for (const tool of createCoreRolloverTools(deps)) {
       this.ctx.tools.register(tool)
+    }
+    this.toolDeps = deps
+    this.syncOptionalTools()
+    // The optionals are mounted and unmounted over the plugin's lifetime, so
+    // unloading has to release whichever ones are live at that moment.
+    this.ctx.effect(() => () => {
+      for (const dispose of this.optionalToolDisposers.splice(0)) dispose()
+    }, 'context-rollover optional tools')
+  }
+
+  /**
+   * Mount exactly the optional tools the effective configuration enables.
+   *
+   * A disabled tool is unmounted rather than left to refuse: the model's tool
+   * surface has to match the policy in force. `tools.register` returns the
+   * disposer that makes this reversible when the card toggles it back on.
+   */
+  private syncOptionalTools(): void {
+    const deps = this.toolDeps
+    if (deps === undefined) return
+    for (const dispose of this.optionalToolDisposers.splice(0)) dispose()
+    const config = this.effective
+    const tools = createOptionalRolloverTools(deps, {
+      notes: config.notesEnabled,
+      history: config.historyEnabled,
+    })
+    for (const tool of tools) {
+      this.optionalToolDisposers.push(this.ctx.tools.register(tool))
     }
   }
 
@@ -299,23 +373,41 @@ export class RolloverController {
       const ownsAutomatic = this.shouldPreemptAutomatic(agent)
       if (!signal.aborted) {
         const pending = this.pendingRollovers.get(agent.session.id)
+        let boundaryKept = false
         if (pending !== undefined) {
           // A model-requested boundary is this plugin's own promise and is
           // kept on every session, preempted or not.
           try {
-            await this.performRollover(agent, {
+            const result = await this.performRollover(agent, {
               reason: 'model-requested',
               handoff: pending.handoff,
             }, signal)
-            this.pendingRollovers.delete(agent.session.id)
+            if (result === null) {
+              // Nothing worth replacing yet. Consuming the request here would
+              // break the promise silently, so it stays queued for a later
+              // boundary — and the pressure path below still gets its turn.
+              ctx.logger.warn(
+                'context rollover: the requested boundary found nothing to replace yet; '
+                + 'keeping the request for the next boundary',
+              )
+            } else {
+              this.pendingRollovers.delete(agent.session.id)
+              boundaryKept = true
+            }
           } catch (error: unknown) {
-            // The commit refused (nothing to shadow yet, or a checkpoint that
-            // would not shrink the surface). Keep the request so a later
-            // boundary can keep it rather than dropping the promise.
+            // The commit refused (a checkpoint that would not shrink the
+            // surface, or a surface that moved under it). Keep the request so
+            // a later boundary can keep it.
             const message = error instanceof Error ? error.message : String(error)
-            ctx.logger.warn(`context rollover failed: ${message}; retrying at the next boundary`)
+            ctx.logger.warn(
+              `context rollover failed: ${message}; falling back to the pressure path `
+              + 'and retrying the request at the next boundary',
+            )
           }
-        } else if (ownsAutomatic) {
+        }
+        // The pressure path is an independent safety net: a pending request
+        // that could not be kept must never stand it down.
+        if (!boundaryKept && ownsAutomatic) {
           try {
             await this.rollOverOnPressure(agent, turn, signal)
           } catch (error: unknown) {
@@ -338,8 +430,10 @@ export class RolloverController {
       const pending = this.pendingRollovers.get(agent.session.id)
       if (pending === undefined || signal.aborted) return
       try {
-        await this.performRollover(agent, { reason: 'model-requested', handoff: pending.handoff }, signal)
-        this.pendingRollovers.delete(agent.session.id)
+        const result = await this.performRollover(agent, { reason: 'model-requested', handoff: pending.handoff }, signal)
+        // A no-op result leaves the request queued: the promise is kept only
+        // by an actual commit.
+        if (result !== null) this.pendingRollovers.delete(agent.session.id)
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error)
         ctx.logger.warn(`context rollover at turn stop failed: ${message}; retrying at the next boundary`)
@@ -467,7 +561,7 @@ export class RolloverController {
     const other = this.otherBackend(agent)
     if (other === undefined) return true
     if (!this.config.preempt) return false
-    if (other instanceof ContextRolloverEngine) return false
+    if (isRolloverEngine(other)) return false
     return this.thresholdComesFirst(other)
   }
 
@@ -519,13 +613,17 @@ export class RolloverController {
     return owning
   }
 
-  /** Remember one resolved backend for the settings card's guidance. */
+  /**
+   * Remember one resolved backend for the settings card's guidance. Keyed by
+   * the instance: two same-named backends at different thresholds are two
+   * facts, and the stricter one must survive the looser one's observation.
+   */
   private observeBackend(engine: CompactionEngine): void {
     const name = typeof engine.name === 'string' && engine.name !== '' ? engine.name : 'compaction'
     const thresholdRatio = readBackendThreshold(engine) ?? null
-    const previous = this.observedBackends.get(name)
+    const previous = this.observedBackends.get(engine)
     if (previous !== undefined && previous.thresholdRatio === thresholdRatio) return
-    this.observedBackends.set(name, { name, thresholdRatio })
+    this.observedBackends.set(engine, { name, thresholdRatio })
   }
 
   /**
@@ -566,6 +664,9 @@ export class RolloverController {
     const notes = this.config.notesEnabled
       ? await this.notesStore(session).renderAll(this.config.handoffMaxChars)
       : null
+    // The notes read is the one await between the entry check and the
+    // irrevocable commit; honour a cancellation that arrived during it.
+    signal.throwIfAborted()
     const windowNumber = countRollovers(session) + 1
     const result = await commitRollover(
       { meter: this.ctx.tokenMeter },
@@ -614,28 +715,58 @@ export class RolloverController {
 
   /** Resolve the notes store for one session. */
   private notesStore(session: Session): NotesStore {
-    return new NotesStore(NotesStore.directoryFor(session.id, this.config.notesDir))
+    return new NotesStore(
+      NotesStore.directoryFor(session.id, this.config.notesDir),
+      // A note the store could not read is surfaced in the checkpoint itself;
+      // the operator log gets the same fact with its error code.
+      message => this.ctx.logger.warn(message),
+    )
   }
 
   /**
-   * Whether a rollover would have a useful span to shadow right now.
+   * Whether a requested boundary would actually commit, judged on the commit's
+   * own budget.
    *
-   * A model-requested boundary on an almost-empty context has nothing to
-   * replace: the checkpoint would be larger than the content it shadows, so
-   * the commit refuses it after the tool already answered. The tool asks this
-   * first and answers honestly instead.
+   * The range check alone is not enough: the commit refuses a checkpoint whose
+   * notes and handoff are not smaller than the span they would replace, so
+   * answering "accepted" on the range check alone promises a boundary that
+   * never starts. The check runs the same `priceCheckpoint` arithmetic the
+   * commit's shrink guard does, which is what keeps the promise and the
+   * refusal from disagreeing.
+   *
+   * An unmeasurable surface still accepts: the commit validates whatever span
+   * it selects, and a genuine refusal is reported honestly at the next
+   * boundary rather than hidden behind a pre-check that gave up.
+   * @param session - session the boundary was requested for.
+   * @param handoff - the model's handoff text, when it supplied one.
+   * @returns `'ok'` when the boundary can commit, otherwise why it cannot.
    */
-  private canRollOver(session: Session): boolean {
+  private async checkBoundary(session: Session, handoff: string | null): Promise<BoundaryCheck> {
     try {
-      return selectRolloverRange(
-        session,
-        this.ctx.tokenMeter.measure(session),
-        this.resolveRetainTokens(session),
-      ) !== null
+      const measurement = this.ctx.tokenMeter.measure(session)
+      const range = selectRolloverRange(session, measurement, this.resolveRetainTokens(session))
+      if (range === null) return 'minimal'
+      const notes = this.config.notesEnabled
+        ? await this.notesStore(session).renderAll(this.config.handoffMaxChars)
+        : null
+      const checkpointText = buildCheckpointText({
+        reason: 'model-requested',
+        windowNumber: countRollovers(session) + 1,
+        notes,
+        handoff,
+      })
+      const shadowedNodes = spanSurfaceNodes(session, measurement, range)
+      if (shadowedNodes === null) return 'ok'
+      const { framedTokenCount, shadowedRouteTokenCount } = priceCheckpoint(
+        this.ctx.tokenMeter,
+        shadowedNodes,
+        checkpointText,
+      )
+      return framedTokenCount < shadowedRouteTokenCount ? 'ok' : 'checkpoint-too-large'
     } catch {
       // An unmeasurable surface is no reason to refuse a boundary the model
       // asked for; the commit still validates the span it selects.
-      return true
+      return 'ok'
     }
   }
 
@@ -696,7 +827,7 @@ export class RolloverController {
     signal: AbortSignal,
     sourceCommandId?: CommandId,
   ): Promise<CompactionResult | null> {
-    const run = async (): Promise<CompactionResult | null> => {
+    const run = async (operationSignal: AbortSignal): Promise<CompactionResult | null> => {
       const session = agent.session
       const range = selectRolloverRange(
         session,
@@ -707,6 +838,11 @@ export class RolloverController {
       const notes = this.config.notesEnabled
         ? await this.notesStore(session).renderAll(this.config.handoffMaxChars)
         : null
+      // Re-checked after the notes IO: reading notes can take long enough for
+      // the command to be cancelled, and committing then would report success
+      // for work the caller already abandoned. Everything past this point is
+      // the irrevocable transaction.
+      operationSignal.throwIfAborted()
       const windowNumber = countRollovers(session) + 1
       return commitRollover(
         { meter: this.ctx.tokenMeter },
@@ -753,6 +889,8 @@ export class RolloverController {
     const notes = this.config.notesEnabled
       ? await this.notesStore(session).renderAll(this.config.handoffMaxChars)
       : null
+    // Everything past this point is the irrevocable transaction.
+    signal?.throwIfAborted()
     const windowNumber = countRollovers(session) + 1
     return commitRollover(
       { meter: this.ctx.tokenMeter },
@@ -809,7 +947,14 @@ export class RolloverController {
     } catch (error: unknown) {
       if (invocation.signal.aborted) return { kind: 'error', text: this.t('manual.cancelled') }
       if (error instanceof ManualCompactionError) return this.manualFailure(error)
-      throw error
+      // A refusal is a stable fact about the requested checkpoint, not a
+      // transient host condition: say what to change rather than implying a
+      // retry would help.
+      if (error instanceof RolloverRefusedError) {
+        return { kind: 'error', text: this.t('manual.tooLarge') }
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      return { kind: 'error', text: this.t('manual.failed', { message }) }
     }
   }
 
@@ -867,20 +1012,36 @@ export class RolloverController {
   /**
    * Run one idle-agent task under `runMaintenance`, mapping cancellation to
    * the manual-failure code a command presents.
+   *
+   * The task receives the operation signal so it can honour cancellation
+   * *inside* its own awaits — a `notes` read can be slow, and checking only
+   * before the task starts would let an aborted command commit afterwards.
+   * Cancellation is honoured up to the irrevocable commit: once
+   * `commitRollover` opens its bracket the transaction finishes and reports
+   * its real outcome.
+   * @param agent - idle agent whose maintenance admission this reserves.
+   * @param task - the operation, given the fused cancellation signal.
+   * @param signal - caller-scoped cancellation.
+   * @returns the task's result.
    */
   private async runMaintained<T>(
     agent: Agent,
-    task: () => Promise<T>,
+    task: (signal: AbortSignal) => Promise<T>,
     signal: AbortSignal,
   ): Promise<T> {
+    let entered = false
     try {
       return await agent.runMaintenance(async (agentSignal) => {
+        entered = true
         const operationSignal = AbortSignal.any([agentSignal, signal])
         try {
           operationSignal.throwIfAborted()
-          return await task()
+          return await task(operationSignal)
         } catch (error: unknown) {
-          if (agentSignal.aborted && operationSignal.reason === agentSignal.reason) {
+          // A real failure keeps its own class; only a cancellation this
+          // wrapper introduced is relabelled.
+          if (error instanceof ManualCompactionError) throw error
+          if (operationSignal.aborted) {
             throw new ManualCompactionError('cancelled', 'manual rollover was cancelled', { cause: error })
           }
           throw error
@@ -888,6 +1049,10 @@ export class RolloverController {
       })
     } catch (error: unknown) {
       if (error instanceof ManualCompactionError) throw error
+      // Only a refusal to *admit* the maintenance counts as busy. The task's
+      // own failures (budget, persistence, commit) keep their real identity so
+      // the command can tell the user what actually went wrong.
+      if (entered) throw error
       throw new ManualCompactionError(
         'busy',
         'manual rollover requires an idle agent with no waking queued work',
@@ -954,6 +1119,16 @@ export class ContextRolloverEngine extends CompactionEngine {
     return this.controller.compactRegion(start, end, agent, signal)
   }
 }
+
+// Brand this copy's prototype. The Web profile loads this module through two
+// different paths behind separate realms, so each copy has to be able to
+// recognize the others' engines; see ENGINE_BRAND.
+Object.defineProperty(ContextRolloverEngine.prototype, ENGINE_BRAND, {
+  value: true,
+  enumerable: false,
+  configurable: true,
+  writable: false,
+})
 
 /**
  * Mount the plugin.

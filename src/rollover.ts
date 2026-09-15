@@ -21,9 +21,9 @@ import {
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, UserMessage } from '@deepseek-ai/dsh-llm'
 import type TokenMeter from '@deepseek-ai/dsh-token-meter'
-import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
+import type { TokenMeasurement, TokenSurfaceNode } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { nodeHeuristicTokens, replaceSurfaceOp, sessionEventAt, sessionEvents } from './compat.ts'
 import type { Seq } from './compat.ts'
@@ -49,6 +49,25 @@ export const REMINDER_SUMMARY_PREFIX = 'context pressure reminder'
 /** The compaction/summary `provider` value written by this backend. */
 export const ROLLOVER_PROVIDER = 'dsh-context-rollover'
 
+/**
+ * A rollover refused before it wrote anything: the checkpoint would not shrink
+ * the surface it replaces.
+ *
+ * Deliberately not a `ManualCompactionError`: those describe transient
+ * host-side conditions a user should retry, while this one is a stable fact
+ * about the requested checkpoint — the actionable answer is to shorten the
+ * notes or the handoff, or to wait for more conversation, not to try again.
+ */
+export class RolloverRefusedError extends Error {
+  constructor(
+    readonly code: 'checkpoint-too-large',
+    message: string,
+  ) {
+    super(message)
+    this.name = 'RolloverRefusedError'
+  }
+}
+
 /** Transaction inputs the engine resolves before committing. */
 export interface RolloverDependencies {
   readonly meter: TokenMeter
@@ -61,6 +80,80 @@ interface SurfaceSelection {
   readonly startIdx: number
   readonly endIdx: number
   readonly shadowedSeqs: readonly Seq[]
+}
+
+/** A span of surface positions, as returned by selection or validation. */
+export interface SurfaceSpan {
+  readonly start: Seq
+  readonly end: Seq
+  readonly shadowedSeqs: readonly Seq[]
+}
+
+/**
+ * The priced surface nodes covering one span, or `null` when the measured
+ * surface no longer matches it — a concurrent change no caller may write
+ * against.
+ * @param session - session whose surface positions are authoritative.
+ * @param measurement - the measurement to slice.
+ * @param span - inclusive first/last surface-node seqs plus the expected nodes.
+ * @returns the nodes, or `null` when the span moved under the measurement.
+ */
+export function spanSurfaceNodes(
+  session: Session,
+  measurement: TokenMeasurement,
+  span: SurfaceSpan,
+): readonly TokenSurfaceNode[] | null {
+  const nodes = session.surface.nodes
+  const startIdx = nodes.indexOf(span.start)
+  const endIdx = nodes.indexOf(span.end)
+  if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) return null
+  const selected = measurement.nodes.slice(startIdx, endIdx + 1)
+  if (selected.length !== span.shadowedSeqs.length
+    || selected.some((node, index) => node.seq !== span.shadowedSeqs[index])) {
+    return null
+  }
+  return selected
+}
+
+/** One checkpoint priced against the span it would replace. */
+export interface PricedCheckpoint {
+  /** Estimated tokens the framed replacement message carries. */
+  readonly framedTokenCount: number
+  /** Routed-request tokens the replaced span currently costs. */
+  readonly shadowedRouteTokenCount: number
+  /** The replacement message, ready to append. */
+  readonly message: UserMessage
+}
+
+/**
+ * Price one checkpoint against the surface nodes it would replace.
+ *
+ * The commit's shrink guard and the model-facing honesty check both read this,
+ * so a boundary is never promised on one budget and then refused on another.
+ * @param meter - the conversation meter used for pricing.
+ * @param shadowedNodes - the routed-price nodes the replacement shadows.
+ * @param checkpointText - the deterministic checkpoint body.
+ * @param compactionId - transaction identity for the checkpoint source; a
+ *   throwaway one is minted when a caller only needs the price.
+ * @param sourceCommandId - initiating manual command, when present.
+ * @returns the framed and shadowed counts plus the message to append.
+ */
+export function priceCheckpoint(
+  meter: TokenMeter,
+  shadowedNodes: readonly TokenSurfaceNode[],
+  checkpointText: string,
+  compactionId: CompactionId = CompactionId(randomUUID()),
+  sourceCommandId?: CommandId,
+): PricedCheckpoint {
+  const message = createUserMessage({
+    content: [{ type: 'text', text: checkpointText }],
+    source: compactCheckpointSource(compactionId, sourceCommandId),
+  })
+  return {
+    framedTokenCount: meter.estimateMessage(message),
+    shadowedRouteTokenCount: shadowedNodes.reduce((total, node) => total + node.tokens, 0),
+    message,
+  }
 }
 
 /** Options for one rollover transaction. */
@@ -259,22 +352,27 @@ export async function commitRollover(
     // The span is validated, priced, and replaced synchronously — no
     // summarization yield, so no stability recheck is required.
     const measurement = dependencies.meter.measure(session)
-    const selectedNodes = measurement.nodes.slice(selection.startIdx, selection.endIdx + 1)
-    if (selectedNodes.length !== selection.shadowedSeqs.length
-      || selectedNodes.some((node, index) => node.seq !== selection.shadowedSeqs[index])) {
+    const selectedNodes = spanSurfaceNodes(session, measurement, selection)
+    if (selectedNodes === null) {
       throw new Error('rollover: the selected surface changed before the replacement committed')
     }
     const shadowedTokenCount = selectedNodes.reduce((total, node) => total + nodeHeuristicTokens(node), 0)
-    const shadowedRouteTokenCount = selectedNodes.reduce((total, node) => total + node.tokens, 0)
 
     const checkpointText = buildCheckpointText(options.checkpoint)
-    const checkpointMessage = createUserMessage({
-      content: [{ type: 'text', text: checkpointText }],
-      source: compactCheckpointSource(compactionId, options.sourceCommandId),
-    })
-    const framedTokenCount = dependencies.meter.estimateMessage(checkpointMessage)
+    const {
+      framedTokenCount,
+      shadowedRouteTokenCount,
+      message: checkpointMessage,
+    } = priceCheckpoint(
+      dependencies.meter,
+      selectedNodes,
+      checkpointText,
+      compactionId,
+      options.sourceCommandId,
+    )
     if (framedTokenCount >= shadowedRouteTokenCount) {
-      throw new Error(
+      throw new RolloverRefusedError(
+        'checkpoint-too-large',
         `rollover checkpoint is not smaller than the shadowed content `
         + `(${framedTokenCount} estimated tokens >= ${shadowedRouteTokenCount}); `
         + 'the active context is too small for a useful rollover',
@@ -487,22 +585,26 @@ export function resetReminderClaims(session: Session): void {
  * been "used" in the sense of spent — the number moves with the conversation
  * in both directions.
  *
- * `TokenMeasurement.totalTokens` speaks in the meter's own terms: when it
- * anchors on a completed call it uses `usageTokens(usage)`, which sums that
- * call's prompt **and its output** — and the next request does not carry the
- * previous response's output. Comparing that total against the context window
- * therefore over-reports every window by one assistant response: measured
- * 2,000–5,100 tokens on a 32k test window, i.e. 6–16%, which fires the
- * reminder and the automatic rollover early.
+ * `TokenMeasurement.totalTokens` is used exactly as the meter reports it. When
+ * the meter anchors on a completed call it prices that call's prompt **and its
+ * output**, and that output is not lost to the next request: the assistant
+ * message stays on the active surface, the conversation is replayed in full,
+ * and the next request carries the previous response again. Subtracting the
+ * output here — as this function once did — under-reports every window by one
+ * assistant response and delays the reminder and the automatic rollover past
+ * the point they exist to catch.
  *
- * Only a `usage` baseline can be corrected this way: an estimated baseline
- * never counted an output.
+ * There is no "block that will not be re-sent" to correct for either: the
+ * shipped provider adapter serializes every assistant block — text, reasoning
+ * (as `reasoning_content`), and tool calls — so the whole surface is replayed.
+ * Should an adapter ever drop a block, this reading is what has to change, and
+ * the end-to-end pressure-accounting assertions (reading vs. the request the
+ * model actually receives) are what expose it.
  * @param measurement - one token-meter measurement.
  * @returns the prompt tokens a request would submit now.
  */
 export function requestPressureTokens(measurement: TokenMeasurement): number {
-  const usage = measurement.baseline.kind === 'usage' ? measurement.baseline.usage : undefined
-  return Math.max(0, measurement.totalTokens - (usage?.outputTokens ?? 0))
+  return Math.max(0, measurement.totalTokens)
 }
 
 /**

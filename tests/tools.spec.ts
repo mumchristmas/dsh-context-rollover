@@ -9,6 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { CommandId } from '@deepseek-ai/dsh-commands'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { countRollovers } from '../src/rollover.ts'
@@ -18,6 +19,7 @@ import {
   ScriptedAdapter,
   seedExchanges,
   textResponse,
+  usageResponseWith,
 } from './harness.ts'
 
 /** Execute one tool through the registry and require success. */
@@ -120,6 +122,77 @@ describe('history tool rendering', () => {
     expect(readText).toContain('[seq ')
     expect(readText).not.toContain('undefined')
     expect(read.value).toMatchObject({ action: 'read' })
+  })
+})
+
+describe('countdown authority', () => {
+  it('reports no automatic countdown where automatic rollover is not armed', async () => {
+    const { ctx, agent, session } = await engineHarness('tools-countdown-off')
+    ctx.llm.registerAdapter(['mock'], new ScriptedAdapter([usageResponseWith('answer', 1000, 5)]))
+    await followup(agent, 'a real measurement')
+
+    // Standard compaction hands automation to the session's own backend, so
+    // there is no boundary for this plugin's countdown to point at. Reporting
+    // one would promise a rollover that never comes.
+    const commandId = CommandId('tools-countdown-off')
+    session.append('command/run', { commandId, name: 'rollover', args: 'off', source: { kind: 'user' } })
+    session.append('command/done', { commandId, kind: 'success' })
+
+    const result = await executeTool(ctx, agent, 'get_context_remaining', {}, 'cr-off')
+    expect(result.value).toMatchObject({ rollover_tokens_left: null })
+    const text = renderedText(result)
+    expect(text).toContain('automatic rollover does not run')
+    expect(text).not.toContain('rollover in')
+    // The honest window reading is still reported.
+    expect((result.value as { prompt_tokens: number }).prompt_tokens).toBeGreaterThan(0)
+  })
+})
+
+describe('history argument bounds', () => {
+  it('refuses impossible limits and counts the ellipsis against the bound', async () => {
+    const { ctx, agent, session, engine } = await engineHarness('tools-argument-bounds', { retainTokens: 0 })
+    ctx.llm.registerAdapter(['mock'], new ScriptedAdapter([textResponse('answer')]))
+    const marker = 'argument-bound-marker'
+    await followup(agent, `${marker} ${'x'.repeat(8000)}`)
+    await followup(agent, 'recent tail')
+    const event = session.snapshotEvents()
+      .find(item => item.type === 'user/message' && JSON.stringify(item.data).includes(marker))
+    if (event === undefined) throw new Error('expected the seeded user message in the log')
+    await engine.compactNow(agent, new AbortController().signal)
+
+    const raw = (arguments_: Record<string, unknown>, callId: string) => ctx.tools.execute({
+      agent,
+      signal: new AbortController().signal,
+      name: 'history',
+      arguments: arguments_,
+      callId: ToolCallId(callId),
+    })
+
+    // A negative bound is not a smaller bound: it is a request the tool cannot
+    // honour, and answering it with a near-full read answered a different
+    // question than the caller asked.
+    const negative = await raw({ action: 'read', seq: event.seq, max_chars: -1 }, 'bounds-read')
+    expect(negative.isError).toBe(true)
+    expect(JSON.stringify(negative.content)).toContain('max_chars must be between')
+
+    const fractional = await raw({ action: 'read', seq: event.seq, max_chars: 1.5 }, 'bounds-fraction')
+    expect(fractional.isError).toBe(true)
+
+    // A bound of zero means zero matches — not the one match the old
+    // push-then-check order returned.
+    const zero = await executeTool(
+      ctx, agent, 'history', { action: 'search', query: marker, max_matches: 0 }, 'bounds-search',
+    )
+    expect(renderedText(zero)).toBe('No matches in history.')
+
+    // The bound covers the whole returned text, the ellipsis included.
+    const bounded = await executeTool(
+      ctx, agent, 'history', { action: 'read', seq: event.seq, max_chars: 100 }, 'bounds-bounded',
+    )
+    const text = (bounded.value as { text: string }).text
+    const body = text.slice(text.indexOf('\n') + 1)
+    expect(body.length).toBeLessThanOrEqual(100)
+    expect(body.endsWith('…')).toBe(true)
   })
 })
 
