@@ -34,6 +34,11 @@ interface Contribution {
   readonly component: (props: Record<string, unknown>) => unknown
 }
 
+/** The mode component's rendered tree, in the shape its state lives in. */
+interface ModeTree {
+  children: Array<{ props: Record<string, unknown>, children?: Array<{ props?: { d?: string } }> }>
+}
+
 /** One recorded settings-scope write. */
 type ScopeCall = [op: 'set' | 'unset', field: string, value?: unknown]
 
@@ -46,6 +51,15 @@ interface FakeScope {
   mutate(ops: ReadonlyArray<{ op: string, path: string[] }>): Promise<void>
   calls: ScopeCall[]
   mutations: Array<ReadonlyArray<{ op: string, path: string[] }>>
+  /**
+   * Whether the Host refuses the next mutation. The refusal shows up as an
+   * unchanged snapshot, not as a resolved value: `SettingsScope` declares
+   * `set`/`unset` as `Promise<void>` and absorbs the `{ ok: false }` envelope
+   * internally, so a caller cannot read the outcome off the promise.
+   */
+  refuse: { value: boolean }
+  /** Whether the next mutation rejects instead (an offline carrier). */
+  reject: { value: boolean }
 }
 
 /** Load the built artifact through the shell's loader contract. */
@@ -54,6 +68,7 @@ function loadClient(): {
   exports: { apply?: (ctx: unknown) => void, inject?: readonly string[], name?: string }
   contributions: Contribution[]
   commands: Array<{ sessionId: string, line: string }>
+  commandResult: { value: unknown }
   effects: number
   dictionaries: Array<{ ns: string, dicts: Record<string, Record<string, string>> }>
   scope: FakeScope
@@ -66,6 +81,8 @@ function loadClient(): {
 
   const contributions: Contribution[] = []
   const commands: Array<{ sessionId: string, line: string }> = []
+  /** What `remote.commands.execute` resolves with. */
+  const commandResult: { value: unknown } = { value: {} }
   const backendRequests: string[] = []
   let effects = 0
 
@@ -161,7 +178,7 @@ function loadClient(): {
         return {
           execute: (sessionId: string, line: string) => {
             commands.push({ sessionId, line })
-            return Promise.resolve({})
+            return Promise.resolve(commandResult.value)
           },
         }
       }
@@ -221,6 +238,7 @@ function loadClient(): {
     exports: loaded.exports,
     contributions,
     commands,
+    commandResult,
     effects,
     dictionaries,
     scope,
@@ -230,34 +248,71 @@ function loadClient(): {
   }
 }
 
-/** A settings scope stub: one overridden field, one inherited from the base. */
+/**
+ * A settings scope stub modelled on the real contract.
+ *
+ * The real `SettingsScope.set`/`unset`/`mutate` resolve `Promise<void>` and
+ * absorb an ordinary Host refusal inside their own `mutate`, so a refusal is
+ * visible only as a snapshot that did not move. The stub therefore keeps a live
+ * document that accepted writes update, and `refuse` makes the Host decline
+ * without touching it — which is the situation the card has to report.
+ */
 function fakeScope(): FakeScope {
   const calls: ScopeCall[] = []
   const mutations: FakeScope['mutations'] = []
+  const refuse: { value: boolean } = { value: false }
+  const reject: { value: boolean } = { value: false }
+  const base: Record<string, unknown> = {
+    thresholdRatio: 0.75,
+    reminderThresholdRatio: 0.6,
+    retainRatio: 0.1,
+    preempt: true,
+  }
+  let value: Record<string, unknown> = { thresholdRatio: 0.9, preempt: true }
+  let user: Record<string, unknown> = { thresholdRatio: 0.9 }
+  const settle = (ops: ReadonlyArray<{ op: string, path: string[], value?: unknown }>): Promise<void> => {
+    if (!refuse.value && !reject.value) {
+      for (const op of ops) {
+        const field = op.path[0]
+        if (field === undefined) continue
+        if (op.op === 'unset') {
+          delete user[field]
+          if (field in base) value[field] = base[field]
+          else delete value[field]
+        } else {
+          user[field] = op.value
+          value[field] = op.value
+        }
+      }
+    }
+    return reject.value ? Promise.reject(new Error('carrier offline')) : Promise.resolve()
+  }
   return {
     calls,
     mutations,
+    refuse,
+    reject,
     getSnapshot: () => ({
       status: 'ready',
       writable: true,
       mode: 'host',
       revision: 3,
-      value: { thresholdRatio: 0.9, preempt: true },
-      base: { thresholdRatio: 0.75, reminderThresholdRatio: 0.6, retainRatio: 0.1, preempt: true },
-      user: { thresholdRatio: 0.9 },
+      value: { ...value },
+      base: { ...base },
+      user: { ...user },
     }),
     subscribe: () => () => undefined,
-    set: (field: string, value: unknown) => {
-      calls.push(['set', field, value])
-      return Promise.resolve()
+    set: (field: string, next: unknown) => {
+      calls.push(['set', field, next])
+      return settle([{ op: 'set', path: [field], value: next }])
     },
     unset: (field: string) => {
       calls.push(['unset', field])
-      return Promise.resolve()
+      return settle([{ op: 'unset', path: [field] }])
     },
     mutate: (ops: ReadonlyArray<{ op: string, path: string[] }>) => {
       mutations.push(ops)
-      return Promise.resolve()
+      return settle(ops)
     },
   }
 }
@@ -316,6 +371,52 @@ function assertExports(value: unknown): { apply?: (ctx: unknown) => void, inject
 }
 
 describe('settings card', () => {
+  /**
+   * Render the card expanded through the hook store, so a state update made by
+   * one interaction is visible to the next render.
+   */
+  function expandedCard(loaded: ReturnType<typeof loadClient>) {
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('the card did not register into the plugin settings slot')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+    return {
+      elements: () => elementsOf(loaded.render(card.component, props)),
+      rerender: () => loaded.render(card.component, props),
+    }
+  }
+
+  /** The card's displayed warnings, in render order. */
+  function warnings(elements: ReturnType<typeof elementsOf>): string[] {
+    return elements
+      .filter(element => String(element.props['className'] ?? '').includes('dsh-warn'))
+      .map(element => String(element.children?.[0] ?? ''))
+  }
+
+  /**
+   * Type into one field and confirm it the way a user does.
+   *
+   * A keystroke and the confirming blur are separate events on separate
+   * renders, so the blur handler closes over the draft that keystroke produced
+   * instead of the value the box held before it. Collapsing them onto one
+   * render would test a component that does not exist.
+   */
+  function typeAndConfirm(
+    loaded: ReturnType<typeof loadClient>,
+    card: Contribution,
+    props: Record<string, unknown>,
+    label: string,
+    value: string,
+  ): void {
+    const field = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === label)
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value } })
+    ;(field()?.props['onBlur'] as () => void)()
+  }
+
   it('registers under its settings namespace and offers every field', () => {
     const loaded = loadClient()
     const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
@@ -386,6 +487,8 @@ describe('settings card', () => {
       'T:card.reminderThresholdRatio',
       'T:card.retainTokens',
       'T:card.preempt',
+      'T:card.notesEnabled',
+      'T:card.historyEnabled',
       'T:card.handoffMaxChars',
     ])
   })
@@ -420,17 +523,14 @@ describe('settings card', () => {
     const collapsed = loaded.render(card.component, props)
     const header = elementsOf(collapsed).find(element => element.props['className'] === 'dsh-head')
     ;(header?.props['onClick'] as () => void)()
-    const elements = elementsOf(loaded.render(card.component, props))
-
     // The scope's threshold is 0.9, so a reminder of 0.95 is incoherent.
-    const reminder = elements.find(element => element.props['aria-label'] === 'T:card.reminderThresholdRatio')
-    ;(reminder?.props['onChange'] as (event: unknown) => void)({ target: { value: '95' } })
+    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '95')
     expect(loaded.scope.calls).toHaveLength(0)
     const warned = JSON.stringify(loaded.render(card.component, props))
     expect(warned).toContain('T:card.invalid.reminder')
 
     // A coherent reminder still writes.
-    ;(reminder?.props['onChange'] as (event: unknown) => void)({ target: { value: '60' } })
+    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '60')
     expect(loaded.scope.calls.at(-1)).toEqual(['set', 'reminderThresholdRatio', 0.6])
   })
 
@@ -454,6 +554,8 @@ describe('settings card', () => {
       { op: 'unset', path: ['reminderThresholdRatio'] },
       { op: 'unset', path: ['retainTokens'] },
       { op: 'unset', path: ['preempt'] },
+      { op: 'unset', path: ['notesEnabled'] },
+      { op: 'unset', path: ['historyEnabled'] },
       { op: 'unset', path: ['handoffMaxChars'] },
     ])
   })
@@ -491,7 +593,7 @@ describe('settings card', () => {
     expect(text).not.toContain('tokens）')
   })
 
-  it('writes one field and clears an override through the scope', () => {
+  it('writes one field and clears an override through the scope', async () => {
     const loaded = loadClient()
     const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
     if (card === undefined) throw new Error('no card')
@@ -499,23 +601,308 @@ describe('settings card', () => {
     const collapsed = loaded.render(card.component, props)
     const header = elementsOf(collapsed).find(element => element.props['className'] === 'dsh-head')
     ;(header?.props['onClick'] as () => void)()
-    const elements = elementsOf(loaded.render(card.component, props))
 
-    const threshold = elements.find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
-    ;(threshold?.props['onChange'] as (event: unknown) => void)({ target: { value: '60' } })
+    typeAndConfirm(loaded, card, props, 'T:card.thresholdRatio', '60')
     expect(loaded.scope.calls.at(-1)).toEqual(['set', 'thresholdRatio', 0.6])
+    // The card holds every control while one write is in flight, so the next
+    // edit waits for the scope to settle — exactly as it does in the browser.
+    await Promise.resolve()
+    await Promise.resolve()
 
-    const inputs = elements.filter(element => element.type === 'input')
+    const inputs = elementsOf(loaded.render(card.component, props)).filter(element => element.type === 'input')
     const preempt = inputs.find(element => element.props['aria-label'] === 'T:card.preempt')
     ;(preempt?.props['onChange'] as (event: unknown) => void)({ target: { checked: false } })
     expect(loaded.scope.calls.at(-1)).toEqual(['set', 'preempt', false])
+    await Promise.resolve()
+    await Promise.resolve()
 
-    const reset = elements.find(element =>
+    const reset = elementsOf(loaded.render(card.component, props)).find(element =>
       element.type === 'button'
       && String(element.props['className'] ?? '').includes('dsh-reset')
       && !String(element.props['className'] ?? '').includes('dsh-reset-deployment'))
     ;(reset?.props['onClick'] as () => void)()
     expect(loaded.scope.calls.at(-1)).toEqual(['unset', 'thresholdRatio'])
+  })
+
+  it('reports a refused write, which only the unchanged snapshot reveals', async () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+
+    // A Host refusal neither rejects nor carries a result: `SettingsScope`
+    // resolves `void` either way and absorbs the `{ ok: false }` envelope, so
+    // the snapshot that did not move is the only evidence the card can act on.
+    loaded.scope.refuse.value = true
+    typeAndConfirm(loaded, card, props, 'T:card.thresholdRatio', '60')
+
+    // While the write is in flight the card's controls are held.
+    const held = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
+    expect(held?.props['disabled']).toBe(true)
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(elementsOf(loaded.render(card.component, props)))).toContain('T:card.writeFailed')
+  })
+
+  it('clears the failure line once a later write lands', async () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+
+    loaded.scope.refuse.value = true
+    typeAndConfirm(loaded, card, props, 'T:card.thresholdRatio', '60')
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(elementsOf(loaded.render(card.component, props)))).toContain('T:card.writeFailed')
+
+    // The line describes one failure. If nothing retires it, the card goes on
+    // accusing a setting that a later write did save.
+    loaded.scope.refuse.value = false
+    typeAndConfirm(loaded, card, props, 'T:card.thresholdRatio', '60')
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(elementsOf(loaded.render(card.component, props)))).not.toContain('T:card.writeFailed')
+  })
+
+  it('clears the failure line once a later reset lands', async () => {
+    const loaded = loadClient()
+    const card = expandedCard(loaded)
+    const resetButton = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      card.elements().find(element =>
+        element.type === 'button'
+        && String(element.props['className'] ?? '').includes('dsh-reset-deployment'))
+
+    loaded.scope.refuse.value = true
+    ;(resetButton()?.props['onClick'] as () => void)()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(card.elements())).toContain('T:card.writeFailed')
+
+    loaded.scope.refuse.value = false
+    ;(resetButton()?.props['onClick'] as () => void)()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(card.elements())).not.toContain('T:card.writeFailed')
+  })
+
+  it('states the refusal in the units the fields show', () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    // Values are captured so the assertion can see what the copy was handed.
+    const props = {
+      t: (key: string, values?: unknown) => `T:${key}${values === undefined ? '' : JSON.stringify(values)}`,
+      scope: loaded.scope,
+    }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+
+    // The scope's threshold is 0.9 while the reminder box shows 60: the refusal
+    // has to speak in the units the user is looking at, not in raw ratios.
+    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '95')
+    const shown = warnings(elementsOf(loaded.render(card.component, props))).join('\n')
+    expect(shown).toContain('"reminder":95')
+    expect(shown).toContain('"threshold":90')
+  })
+
+  it('says nothing when the settled snapshot holds what the write asked for', async () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+
+    typeAndConfirm(loaded, card, props, 'T:card.thresholdRatio', '60')
+    await Promise.resolve()
+    await Promise.resolve()
+    // The stub applies accepted writes to its document, so the field settles on
+    // 0.6: the comparison must stay quiet rather than crying wolf every time.
+    expect(warnings(elementsOf(loaded.render(card.component, props)))).not.toContain('T:card.writeFailed')
+  })
+
+  it('writes only the value that was confirmed, never an intermediate keystroke', () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+    const field = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
+
+    // Typing 65 passes through 6. Neither is a value the user chose, and
+    // because settings apply live, an intermediate write would change the
+    // rollover policy for real before the number was finished.
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value: '6' } })
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value: '65' } })
+    expect(loaded.scope.calls).toHaveLength(0)
+
+    ;(field()?.props['onBlur'] as () => void)()
+    expect(loaded.scope.calls).toEqual([['set', 'thresholdRatio', 0.65]])
+  })
+
+  it('confirms a draft on Enter as well as on blur', () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+    const field = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
+
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value: '65' } })
+    ;(field()?.props['onKeyDown'] as (event: unknown) => void)({
+      key: 'Enter',
+      preventDefault: () => undefined,
+    })
+    expect(loaded.scope.calls).toEqual([['set', 'thresholdRatio', 0.65]])
+  })
+
+  it('restores the stored value on Escape without writing', () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+    const field = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
+
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value: '65' } })
+    ;(field()?.props['onKeyDown'] as (event: unknown) => void)({ key: 'Escape' })
+    // The abandoned draft is gone, so the later blur confirms nothing.
+    expect(field()?.props['value']).toBe('90')
+    ;(field()?.props['onBlur'] as () => void)()
+    expect(loaded.scope.calls).toHaveLength(0)
+  })
+
+  it('consumes Escape while a draft is open and leaves it alone otherwise', () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+    const field = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
+
+    // The shell closes the settings surface on Escape. Reverting a draft is
+    // this control's own use of the key, so the event must not also reach the
+    // shell — one Escape otherwise reverted the box and dismissed the page.
+    const seen: string[] = []
+    const escape = {
+      key: 'Escape',
+      preventDefault: () => seen.push('preventDefault'),
+      stopPropagation: () => seen.push('stopPropagation'),
+    }
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value: '65' } })
+    ;(field()?.props['onKeyDown'] as (event: unknown) => void)(escape)
+    expect(seen).toEqual(['preventDefault', 'stopPropagation'])
+    expect(loaded.scope.calls).toHaveLength(0)
+
+    // Nothing to revert, so the key belongs to the shell again: a focused field
+    // must not become a keyboard trap for the close gesture.
+    seen.length = 0
+    ;(field()?.props['onKeyDown'] as (event: unknown) => void)(escape)
+    expect(seen).toEqual([])
+  })
+
+  it('mounts the two tool switches and writes them', () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+    const advanced = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-advanced')
+    ;(advanced?.props['onClick'] as () => void)()
+
+    const toggle = (label: string): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === label)
+    // The engine mounts and unmounts these tools as the values change, so the
+    // card has to be able to turn them back on from here.
+    expect(toggle('T:card.notesEnabled')).toBeDefined()
+    expect(toggle('T:card.historyEnabled')).toBeDefined()
+
+    ;(toggle('T:card.notesEnabled')?.props['onChange'] as (event: unknown) => void)({
+      target: { checked: false },
+    })
+    expect(loaded.scope.calls.at(-1)).toEqual(['set', 'notesEnabled', false])
+  })
+
+  it('reports a rejected write when the carrier fails outright', async () => {
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+
+    loaded.scope.reject.value = true
+    typeAndConfirm(loaded, card, props, 'T:card.thresholdRatio', '60')
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(elementsOf(loaded.render(card.component, props)))).toContain('T:card.writeFailed')
+  })
+
+  it('reports a refused reset-all instead of throwing over it', async () => {
+    const loaded = loadClient()
+    // The Host refusing the reset leaves the overrides in place; a rejection is
+    // the transport-level shape of the same failure. Here the Host refuses.
+    loaded.scope.refuse.value = true
+    const card = expandedCard(loaded)
+    const resetAll = card.elements().find(element =>
+      element.type === 'button'
+      && String(element.props['className'] ?? '').includes('dsh-reset-deployment'))
+    expect(resetAll).toBeDefined()
+    ;(resetAll?.props['onClick'] as () => void)()
+
+    // The rejection path used to call an undefined name, so a failed reset
+    // surfaced as a ReferenceError rather than as the failure itself.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(loaded.scope.mutations).toHaveLength(1)
+    expect(warnings(card.elements())).toContain('T:card.writeFailed')
+  })
+
+  it('reports a reset-all whose carrier rejected', async () => {
+    const loaded = loadClient()
+    loaded.scope.reject.value = true
+    const card = expandedCard(loaded)
+    const resetAll = card.elements().find(element =>
+      element.type === 'button'
+      && String(element.props['className'] ?? '').includes('dsh-reset-deployment'))
+    ;(resetAll?.props['onClick'] as () => void)()
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(warnings(card.elements())).toContain('T:card.writeFailed')
   })
 })
 
@@ -665,4 +1052,97 @@ describe('browser half', () => {
     expect(loaded.commands.at(-1)).toEqual({ sessionId: 'session-1', line: '/rollover on' })
   })
 
+  it('reports a refused mode change instead of silently keeping the old mode', async () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    // A handler that refuses settles as `CommandExecution { commandId, result }`
+    // with `result.kind === 'error'`. The outcome lives in `result`, so reading
+    // the top level — as this once did — finds no failure at all.
+    loaded.commandResult.value = { commandId: 'c1', result: { kind: 'error', text: 'mode change rejected' } }
+    const props = {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    }
+    const before = loaded.render(contribution.component, props) as ModeTree
+    ;(elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void)()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(loaded.commands.at(-1)).toEqual({ sessionId: 'session-1', line: '/rollover off' })
+    // Still the old mode — no optimistic flip — but the failure is visible.
+    const after = loaded.render(contribution.component, props) as ModeTree
+    const afterButton = elementsOf(after).find(element => element.props['data-context-rollover-mode'] !== undefined)
+    expect(afterButton?.props['data-context-rollover-mode']).toBe('rollover')
+    const error = elementsOf(after).find(element => element.props['className'] === 'dsh-mode-error')
+    expect(String(error?.children?.[0] ?? '')).toContain('mode change rejected')
+    expect(String(afterButton?.props['title'])).toContain('mode change rejected')
+  })
+
+  it('treats an admission miss as a failed mode change', async () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    // `undefined` is the documented admission miss: the line never reached a
+    // handler, so nothing changed and the button must not claim otherwise.
+    loaded.commandResult.value = undefined
+    const props = {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    }
+    const before = loaded.render(contribution.component, props) as ModeTree
+    ;(elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void)()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const after = loaded.render(contribution.component, props) as ModeTree
+    const error = elementsOf(after).find(element => element.props['className'] === 'dsh-mode-error')
+    expect(error).toBeDefined()
+    // No detail is available for an admission miss, but the button still has to
+    // say that nothing happened rather than silently keeping the old mode.
+    expect(String(error?.children?.[0] ?? '')).toMatch(/模式未切换|Mode not changed/)
+  })
+
+  it('reads a failure the Remote seam reports as an envelope', async () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    // The sibling settings scope unwraps a `{ ok, error }` envelope, so the same
+    // shape is handled here even though the typed contract does not name it.
+    loaded.commandResult.value = { ok: false, error: { code: 'gateway/internal', message: 'carrier offline' } }
+    const props = {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    }
+    const before = loaded.render(contribution.component, props) as ModeTree
+    ;(elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void)()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const after = loaded.render(contribution.component, props) as ModeTree
+    const error = elementsOf(after).find(element => element.props['className'] === 'dsh-mode-error')
+    expect(String(error?.children?.[0] ?? '')).toContain('carrier offline')
+  })
+
+  it('holds the mode button while its change is in flight', async () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    const props = {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    }
+    const before = loaded.render(contribution.component, props) as ModeTree
+    const click = elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void
+
+    click()
+    // A second click before the first settles would queue the opposite change.
+    click()
+    expect(loaded.commands).toHaveLength(1)
+    const pending = loaded.render(contribution.component, props) as ModeTree
+    const pendingButton = elementsOf(pending).find(element => element.type === 'button')
+    expect(pendingButton?.props['disabled']).toBe(true)
+
+    await Promise.resolve()
+    await Promise.resolve()
+    const settled = loaded.render(contribution.component, props) as ModeTree
+    const settledButton = elementsOf(settled).find(element => element.type === 'button')
+    expect(settledButton?.props['disabled']).toBe(false)
+  })
 })
