@@ -144,6 +144,8 @@ Thanks to athif23, who started the original
 [dsh-context-rollover](https://github.com/athif23/dsh-context-rollover). Its design, the
 experiments, and the groundwork are his; this repository rewrites and continues that work.
 
+Written with DeepSeek V4.1 Flash and cross-audited by GPT-6-Astra Max.
+
 ## License
 
 MIT

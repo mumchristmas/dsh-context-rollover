@@ -127,6 +127,8 @@ https://github.com/mumchristmas/dsh-context-rollover/issues
 [dsh-context-rollover](https://github.com/athif23/dsh-context-rollover)：它的设计、实验与
 地基都出自他，本仓库在此基础上做了改写与延续。
 
+本项目基于 DeepSeek V4.1 Flash 编写，并经过 GPT-6-Astra Max 交叉审计。
+
 ## 许可证
 
 MIT
