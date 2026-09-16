@@ -33,6 +33,8 @@ import { NotesStore } from '../src/notes.ts'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { RolloverConfig } from '../src/config.ts'
 import { ROLLOVER_PROVIDER, countRollovers } from '../src/rollover.ts'
+import { replaceSurfaceOp } from '../src/compat.ts'
+import type { Seq } from '../src/compat.ts'
 import {
   MODEL,
   TextAdapter,
@@ -517,5 +519,74 @@ describe('/rollover now', () => {
     })
     expect(result?.kind).toBe('success')
     expect(countRollovers(session)).toBe(1)
+  })
+
+  it('declares a stable definition identity beside the name', async () => {
+    const { registered } = await commandHarness()
+    const definition = registered.get('rollover')
+    // Read structurally: `definitionId` is additive on the newer host line and
+    // absent from the older line's type, so the assertion must hold on both.
+    // It is what client-side pairing keys on, which is why it must not be the
+    // command's human-facing (and translatable) name.
+    const identity = (definition as unknown as { definitionId?: string } | undefined)?.definitionId
+    expect(identity).toBe('context-rollover:rollover')
+    expect(identity).not.toBe(definition?.name)
+  })
+})
+
+describe('mount failure', () => {
+  it('unwinds every registration made before a later one fails', async () => {
+    const ctx = await mountTestContext()
+    // Registration four of six refuses. Hot reload no longer rolls a failed
+    // activation back, so without an explicit unwind the tools mounted by step
+    // one would stay live with nothing holding their disposers.
+    ;(ctx as unknown as { provide(name: string, value: unknown): void }).provide('commands', {
+      register: () => { throw new Error('command registry refused') },
+    })
+
+    expect(() => new RolloverController(ctx, { notesDir: 'ignored' }))
+      .toThrow('command registry refused')
+
+    // The earlier steps are gone again, not half-mounted.
+    expect(ctx.tools.get('new_context')).toBeUndefined()
+    expect(ctx.tools.get('get_context_remaining')).toBeUndefined()
+  })
+
+  it('leaves a later, successful mount fully available', async () => {
+    const ctx = await mountTestContext()
+    new RolloverController(ctx, { notesDir: await tempNotesDir() })
+    expect(ctx.tools.get('new_context')).toBeDefined()
+    expect(ctx.tools.get('get_context_remaining')).toBeDefined()
+  })
+})
+
+describe('host declaration', () => {
+  /**
+   * Mount a controller over a context that answers package lookups with one
+   * version, and report the surface op it would write.
+   */
+  async function opForDeclaredVersion(version: string): Promise<unknown> {
+    const ctx = await mountTestContext()
+    ;(ctx as unknown as { provide(name: string, value: unknown): void }).provide('pluginPackages', {
+      packageOf: () => ({ version }),
+    })
+    new RolloverController(ctx, { notesDir: await tempNotesDir() })
+    return replaceSurfaceOp(0 as Seq, 1 as Seq)
+  }
+
+  it('takes the shape from a resolver that names the host line', async () => {
+    // A pre-0.1.5 line takes the legacy pair...
+    expect(await opForDeclaredVersion('0.1.3-alpha.2')).toEqual({ op: 'replace', start: 0, end: 1 })
+    // ...and every runnable line takes the seq pair. The last declaration also
+    // leaves the process-global shape at what this host actually validates, so
+    // the remaining cases in this file are unaffected by the order they run in.
+    expect(await opForDeclaredVersion('0.1.6-alpha.1')).toEqual({ op: 'replace', startSeq: 0, endSeq: 1 })
+  })
+
+  it('ignores a resolver that cannot name a recognizable version', async () => {
+    // `workspace:^` and friends are unknown, not old: guessing would append an
+    // op the host rejects. The probe stays in charge, and on any host these
+    // tests can run against the probe answers with the seq pair.
+    expect(await opForDeclaredVersion('workspace:^')).toEqual({ op: 'replace', startSeq: 0, endSeq: 1 })
   })
 })

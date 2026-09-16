@@ -67,19 +67,72 @@ function modeFromEvent(event: SessionEvent): RolloverMode | undefined {
 }
 
 /**
+ * Structural view of the projection registry this module can read through.
+ *
+ * Deliberately not a type import: the projection package's root types are not
+ * published on every supported host line, and `stateOf` is the only member
+ * used here.
+ */
+export interface ModeProjectionReader {
+  /**
+   * Read one registered unit's current host state, folding the session's own
+   * log up to its cursor on first use and incrementally after that.
+   * @param session - the session whose state is read.
+   * @param key - the registered unit key.
+   * @returns the current state, or `undefined` when the key is unregistered.
+   */
+  stateOf(session: Session, key: string): unknown
+}
+
+/**
  * The mode a session runs: the newest recorded selection, or `rollover` when
- * the session never selected one. Read from the durable log on every call, so a
- * resumed or forked session keeps the choice it was made under.
- * @param session - session whose log to fold.
+ * the session never selected one. A resumed or forked session therefore keeps
+ * the choice it was made under.
+ *
+ * Read through the session projection when the deployment has that registry:
+ * the projection is the host's own incremental fold of exactly this decision,
+ * so the answer is synchronous, current to the session cursor, and free of the
+ * full-log scan this otherwise repeats on every step. The registry answers only
+ * for a projection it has actually registered, so an absent or unregistered
+ * registry falls back to folding the log directly — the same answer, at the
+ * cost of a scan.
+ * @param session - session whose mode to resolve.
+ * @param projections - the projection registry, when the deployment has one.
  * @returns the session's effective context-management mode.
  */
-export function sessionMode(session: Session): RolloverMode {
+export function sessionMode(session: Session, projections?: ModeProjectionReader): RolloverMode {
+  const projected = projectedMode(session, projections)
+  if (projected !== undefined) return projected
   let mode: RolloverMode = 'rollover'
   for (const event of sessionEvents(session)) {
     const selected = modeFromEvent(event)
     if (selected !== undefined) mode = selected
   }
   return mode
+}
+
+/**
+ * The projected mode, when a registry can serve one.
+ *
+ * A registry read is host state, not plugin state: it may throw for a session
+ * it does not own, and declining to answer is a normal outcome rather than a
+ * failure. Either way the caller falls back to the log, so a hostile or
+ * half-initialized registry can never decide a session's context policy.
+ * @param session - session whose mode to resolve.
+ * @param projections - the projection registry, when the deployment has one.
+ * @returns the projected mode, or `undefined` when none is available.
+ */
+function projectedMode(
+  session: Session,
+  projections: ModeProjectionReader | undefined,
+): RolloverMode | undefined {
+  if (projections === undefined) return undefined
+  try {
+    const state = projections.stateOf(session, MODE_PROJECTION_KEY)
+    return state === 'rollover' || state === 'compact' ? state : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**

@@ -234,7 +234,11 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
       schema: { type: 'json' },
       render: (_args, rawValue) => {
         const value = rawValue as unknown as ContextRemainingResult
-        if (value.prompt_tokens === null || value.context_window === null) {
+        // Rendered from whatever the payload actually carries: a field an older
+        // payload omitted must not take the whole reading down with it.
+        const shown = (candidate: unknown): candidate is number =>
+          typeof candidate === 'number' && Number.isFinite(candidate)
+        if (!shown(value.prompt_tokens) || !shown(value.context_window)) {
           return [{ type: 'text', text: 'not measured yet' }]
         }
         const num = (n: number): string => n.toLocaleString('en-US')
@@ -242,9 +246,9 @@ function getContextRemainingTool(deps: RolloverToolDependencies) {
           `prompt used   ${num(value.prompt_tokens)} / ${num(value.context_window)} `
           + `(${Math.round((value.prompt_tokens / value.context_window) * 100)}%)`,
         ]
-        if (value.surface_tokens !== null) lines.push(`  of which conversation ${num(value.surface_tokens)}`)
-        if (value.prompt_tokens_left !== null) lines.push(`window left   ${num(value.prompt_tokens_left)}`)
-        if (value.rollover_tokens_left !== null) {
+        if (shown(value.surface_tokens)) lines.push(`  of which conversation ${num(value.surface_tokens)}`)
+        if (shown(value.prompt_tokens_left)) lines.push(`window left   ${num(value.prompt_tokens_left)}`)
+        if (shown(value.rollover_tokens_left)) {
           lines.push(`rollover in   ${num(value.rollover_tokens_left)}`)
         } else {
           lines.push('rollover      off: automatic rollover does not run for this session')

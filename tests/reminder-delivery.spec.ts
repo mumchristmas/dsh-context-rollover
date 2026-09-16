@@ -107,6 +107,10 @@ describe('pressure reminder delivery', () => {
       thresholdRatio: 0.001,
       reminderThresholdRatio: 0.001,
       retainTokens: 0,
+      // Claim slots advance with the window, and the case is about the window
+      // boundary, not about when the boundary is reached: the band would only
+      // move the crossing later without changing what is being tested.
+      lastChanceRatio: 0,
     })
     const adapter = new ScriptedAdapter([
       usageResponse(`research answer one ${'detail '.repeat(600)}`, 5000),

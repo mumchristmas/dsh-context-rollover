@@ -36,6 +36,16 @@ export interface RolloverSettings {
   thresholdRatio?: number
   /** One-time checkpoint reminder point as a fraction of the context window. */
   reminderThresholdRatio?: number
+  /**
+   * Width of the last-chance band above the rollover point, as a fraction of
+   * the window. `0` disables the band.
+   */
+  lastChanceRatio?: number
+  /**
+   * Keep the open turn's human message out of the replaced span even when the
+   * retained-tail budget would have taken it.
+   */
+  pinActiveRequest?: boolean
   /** Recent verbatim tail kept across a rollover, as a fraction of the window. */
   retainRatio?: number
   /** Absolute recent-tail budget in tokens; overrides `retainRatio` when set. */
@@ -57,6 +67,8 @@ const ENGINE_DEFAULTS = resolveConfig({})
 export const RolloverSettingsSchema: z<RolloverSettings> = z.object({
   thresholdRatio: z.number().default(ENGINE_DEFAULTS.thresholdRatio),
   reminderThresholdRatio: z.number().default(ENGINE_DEFAULTS.reminderThresholdRatio),
+  lastChanceRatio: z.number().default(ENGINE_DEFAULTS.lastChanceRatio),
+  pinActiveRequest: z.boolean().default(ENGINE_DEFAULTS.pinActiveRequest),
   retainRatio: z.number().default(ENGINE_DEFAULTS.retainRatio),
   retainTokens: z.number().step(1).min(0),
   handoffMaxChars: z.number().step(1).min(0).default(ENGINE_DEFAULTS.handoffMaxChars),
@@ -80,6 +92,8 @@ export function settingsBase(rowConfig: RolloverConfig): RolloverSettings {
   return {
     thresholdRatio: resolved.thresholdRatio,
     reminderThresholdRatio: resolved.reminderThresholdRatio,
+    lastChanceRatio: resolved.lastChanceRatio,
+    pinActiveRequest: resolved.pinActiveRequest,
     retainRatio: resolved.retainRatio,
     ...(resolved.retainTokens === null ? {} : { retainTokens: resolved.retainTokens }),
     handoffMaxChars: resolved.handoffMaxChars,

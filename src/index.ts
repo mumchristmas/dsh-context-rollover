@@ -43,11 +43,13 @@ import type { RolloverReason } from './checkpoint.ts'
 import { buildCheckpointText } from './checkpoint.ts'
 import { CONTEXT_MANAGEMENT_GUIDANCE } from './guidance.ts'
 import { NotesStore } from './notes.ts'
-import { sessionEventAt } from './compat.ts'
+import { declareHostVersion, sessionEventAt } from './compat.ts'
 import {
+  claimLastChance,
   claimReminder,
   commitRollover,
   countRollovers,
+  LAST_CHANCE_SUMMARY_PREFIX,
   measuredPromptTokens,
   priceCheckpoint,
   REMINDER_SUMMARY_PREFIX,
@@ -62,7 +64,7 @@ import {
   modeProjectionDefinition,
   sessionMode,
 } from './mode.ts'
-import type { RolloverMode } from './mode.ts'
+import type { ModeProjectionReader, RolloverMode } from './mode.ts'
 import { hostTranslator } from './i18n.ts'
 import { installSettings } from './settings.ts'
 import {
@@ -75,6 +77,15 @@ import type { PendingRollover } from './state.ts'
 
 /** Cordis plugin name used by loader diagnostics and message-source attribution. */
 export const name = 'context-rollover'
+
+/**
+ * Stable identity of the `/rollover` command definition, namespaced by plugin.
+ *
+ * The command's *name* is what a human types and is free to change or be
+ * translated; this identity is what client-side pairing keys on, so a composer
+ * keeps matching the same command across either.
+ */
+export const COMMAND_DEFINITION_ID = `${name}:rollover`
 
 /** Services the plugin needs before it is applied. */
 export const inject = ['llm', 'tokenMeter', 'sessions', 'tools', 'systemPrompt']
@@ -126,6 +137,26 @@ function turnKey(sessionId: string, turn: number): string {
 }
 
 /**
+ * One pressure reading together with the automatic points it is judged against.
+ *
+ * Produced in exactly one place ({@link RolloverController.pressureReading}) so
+ * the numbers a notice shows, the numbers a tool reports, and the numbers a
+ * rollover decision uses are the same arithmetic on the same measurement.
+ */
+interface PressureReading {
+  /** Prompt tokens a request submitted now would carry. */
+  readonly promptTokens: number
+  /** The routed model's context window, as the session reports it. */
+  readonly contextWindow: number
+  /** Where the automatic rollover fires. */
+  readonly thresholdTokens: number
+  /** Width of the last-chance band; `0` when the protocol is switched off. */
+  readonly graceTokens: number
+  /** Where the band opens: the threshold minus its width, clamped at zero. */
+  readonly graceStartTokens: number
+}
+
+/**
  * Minimal agent-preset roster shape, read without a peer dependency on the
  * preset package (the published package mirror does not carry it): resolved
  * at call time through the service store, so rosterless deployments simply
@@ -146,6 +177,41 @@ function rosterOf(ctx: Context): AgentPresetRoster | undefined {
 /** Resolve a Cordis traced service proxy to the concrete registered instance. */
 function concreteCompaction(engine: CompactionEngine): CompactionEngine {
   return (engine as CompactionEngine & { [symbols.original]?: CompactionEngine })[symbols.original] ?? engine
+}
+
+/**
+ * Minimal shape of the deterministic package resolver (host 0.1.6+): resolves
+ * a specifier to the manifest of the package that owns it.
+ */
+interface PluginPackageResolver {
+  packageOf(specifier: string, parentURL: string): { readonly version?: string } | undefined
+}
+
+/**
+ * Tell the compat layer which host line is loaded, when the deployment can
+ * name it at all.
+ *
+ * `ctx.pluginPackages` turns the `replace` surface-op shape from something
+ * discovered by appending a probe event and matching an error message into
+ * something looked up from a released version number. Absent on older hosts,
+ * and harmless when the lookup misses or answers with something unrecognized:
+ * `replaceSurfaceOp` still probes, so this is a shortcut with a working
+ * fallback rather than a new dependency.
+ * @param ctx - context that may carry the resolver.
+ */
+function declareHost(ctx: Context): void {
+  const resolver = (ctx as unknown as { get(name: string): unknown }).get('pluginPackages') as
+    | PluginPackageResolver
+    | undefined
+  if (resolver === undefined || resolver === null || typeof resolver.packageOf !== 'function') return
+  try {
+    // The session package is the one whose surface-op vocabulary is being
+    // classified. Resolved from this module so Node applies the plugin's own
+    // lookup order — the peer dependency the host actually loaded.
+    declareHostVersion(resolver.packageOf('@deepseek-ai/dsh-session', import.meta.url)?.version)
+  } catch {
+    // A resolver that cannot answer leaves the runtime probe in charge.
+  }
 }
 
 /**
@@ -175,6 +241,13 @@ interface CommandRegistry {
   register(definition: {
     readonly name: string
     readonly description: string
+    /**
+     * Stable plugin-owned identity, independent of the command's name and
+     * copy. Optional, and simply absent on hosts that predate it: the field is
+     * additive, so declaring it costs one ignored property on an older line
+     * and buys client-side pairing that survives a rename or a translation.
+     */
+    readonly definitionId?: string
     /**
      * Declaring an input descriptor is what lets a composer claim the text
      * after `/name ` as this command's argument. Without it a Web composer
@@ -227,6 +300,13 @@ export class RolloverController {
   private readonly optionalToolDisposers: Array<() => void> = []
   /** Tool collaborators, retained so a settings change can remount the optionals. */
   private toolDeps: RolloverToolDependencies | undefined
+  /**
+   * The projection registry this controller reads the per-session mode
+   * through, when the deployment has one that can answer.
+   */
+  private projectionRegistry: ModeProjectionReader | undefined
+  /** Disposers for this controller's own registrations, in mount order. */
+  private readonly mounted: Array<() => void> = []
 
   /**
    * @param ctx - context owning every registration this controller makes.
@@ -242,18 +322,62 @@ export class RolloverController {
     this.rowConfig = config
     this.effective = resolveConfig(config)
     this.t = hostTranslator(ctx)
-    this.registerTools()
-    this.registerGuidance()
-    this.registerModeProjection()
-    this.registerCommand()
-    this.registerLifecycle()
-    installSettings(ctx, this.rowConfig, (effective) => {
-      this.effective = effective
-      // The optional tool surface follows the same effective configuration the
-      // thresholds do, so a card toggle reaches the model without a restart.
-      this.syncOptionalTools()
-    })
-    registerBackendRoute(ctx, () => this.backendReport())
+    declareHost(ctx)
+    try {
+      this.registerTools()
+      this.registerGuidance()
+      this.registerModeProjection()
+      this.registerCommand()
+      this.registerLifecycle()
+      installSettings(ctx, this.rowConfig, (effective) => {
+        this.effective = effective
+        // The optional tool surface follows the same effective configuration the
+        // thresholds do, so a card toggle reaches the model without a restart.
+        this.syncOptionalTools()
+      })
+      registerBackendRoute(ctx, () => this.backendReport())
+    } catch (error: unknown) {
+      // Hot reload no longer rolls a failed activation back (0.1.6 removed the
+      // transaction), so a throw part-way through this sequence would otherwise
+      // leave this controller's tools, guidance, listeners, and service route
+      // live with nothing holding their disposers. Unwinding explicitly makes
+      // "partially mounted" unobservable rather than merely unlikely.
+      this.withdraw()
+      throw error
+    }
+  }
+
+  /**
+   * Remember one registration's disposer so a failed mount can release it.
+   * @param dispose - the registration's own disposer.
+   */
+  private mount(dispose: () => void): void {
+    this.mounted.push(dispose)
+  }
+
+  /**
+   * Release every registration this controller made, newest first.
+   *
+   * Teardown of a registration that already failed must not replace the
+   * original failure with its own, so each disposer is released independently.
+   * Our own copies are dropped before the disposers run, so a nested failure
+   * cannot make this recurse.
+   */
+  private withdraw(): void {
+    for (const dispose of this.mounted.splice(0).reverse()) {
+      try {
+        dispose()
+      } catch {
+        // The original mount failure is the fact callers must see.
+      }
+    }
+    for (const dispose of this.optionalToolDisposers.splice(0)) {
+      try {
+        dispose()
+      } catch {
+        // Same: reported by whoever owns the mount, not by this unwind.
+      }
+    }
   }
 
   /**
@@ -273,19 +397,19 @@ export class RolloverController {
       meter: this.ctx.tokenMeter,
       pendingRollovers: this.pendingRollovers,
       canRollOver: (session, handoff) => this.checkBoundary(session, handoff),
-      modeOf: session => sessionMode(session),
+      modeOf: session => this.modeOf(session),
       automaticArmed: agent => this.shouldPreemptAutomatic(agent),
     }
     for (const tool of createCoreRolloverTools(deps)) {
-      this.ctx.tools.register(tool)
+      this.mount(this.ctx.tools.register(tool))
     }
     this.toolDeps = deps
     this.syncOptionalTools()
     // The optionals are mounted and unmounted over the plugin's lifetime, so
     // unloading has to release whichever ones are live at that moment.
-    this.ctx.effect(() => () => {
+    this.mount(this.ctx.effect(() => () => {
       for (const dispose of this.optionalToolDisposers.splice(0)) dispose()
-    }, 'context-rollover optional tools')
+    }, 'context-rollover optional tools'))
   }
 
   /**
@@ -311,26 +435,41 @@ export class RolloverController {
 
   /** Mount the stable context-management guidance section. */
   private registerGuidance(): void {
-    this.ctx.systemPrompt.section({
+    this.mount(this.ctx.systemPrompt.section({
       name: 'context:rollover',
       order: 2350,
       text: CONTEXT_MANAGEMENT_GUIDANCE,
-    })
+    }))
   }
 
   /**
-   * Publish the per-session mode to clients. Absent without a projection
-   * registry; the mode itself lives in the session log either way.
+   * Publish the per-session mode to clients, and retain the registry as this
+   * controller's mode reader. Absent without a projection registry; the mode
+   * itself lives in the session log either way.
    */
   private registerModeProjection(): void {
     const registry = (this.ctx as unknown as { get(name: string): unknown }).get('sessionProjections') as
-      | { register(definition: unknown): () => void }
+      | ({ register(definition: unknown): () => void } & Partial<ModeProjectionReader>)
       | undefined
     if (registry === undefined || typeof registry.register !== 'function') return
-    this.ctx.effect(
+    // Retained for reads as well as writes: a registry that can fold this
+    // projection can answer for it, and that answer replaces the per-step log
+    // scan {@link modeOf} would otherwise repeat. A registry without `stateOf`
+    // keeps the scan, so this stays additive on every supported host line.
+    if (typeof registry.stateOf === 'function') this.projectionRegistry = registry as ModeProjectionReader
+    this.mount(this.ctx.effect(
       () => registry.register(modeProjectionDefinition) as unknown as () => void,
       'context-rollover mode projection',
-    )
+    ))
+  }
+
+  /**
+   * The context-management mode one session runs.
+   * @param session - session whose mode to resolve.
+   * @returns the session's effective mode.
+   */
+  private modeOf(session: Session): RolloverMode {
+    return sessionMode(session, this.projectionRegistry)
   }
 
   /**
@@ -343,15 +482,16 @@ export class RolloverController {
       | CommandRegistry
       | undefined
     if (registry === undefined || typeof registry.register !== 'function') return
-    this.ctx.effect(() => {
+    this.mount(this.ctx.effect(() => {
       const dispose = registry.register({
         name: 'rollover',
+        definitionId: COMMAND_DEFINITION_ID,
         description: this.t('command.description'),
         input: { hint: '[on|off|status|now]' },
         handler: invocation => this.handleRolloverCommand(invocation),
       })
       return () => { dispose() }
-    }, 'context-rollover command')
+    }, 'context-rollover command'))
   }
 
   /** Register the pending-rollover, pressure, and overflow lifecycle listeners. */
@@ -361,7 +501,7 @@ export class RolloverController {
     // Prepend: this listener runs before every other `agent/pre-step`
     // participant — including the realm's ordinary compaction backend — so a
     // pressured window rolls over before a summarizer reaches its threshold.
-    ctx.on('agent/pre-step', async (
+    this.mount(ctx.on('agent/pre-step', async (
       { agent, turn, signal },
       next,
     ): Promise<PreStepDecision> => {
@@ -419,14 +559,18 @@ export class RolloverController {
       const decision = await next()
       if (decision.kind === 'reject') return decision
       if (!ownsAutomatic) return decision
-      const reminder = this.pendingReminder(agent.session)
+      // The escalation is resolved first and wins the step: a window that is
+      // already inside the last-chance band is past the point an ordinary
+      // notice describes, and delivering both would spend a whole step's
+      // headroom on two messages about the same window.
+      const reminder = this.pendingLastChance(agent.session) ?? this.pendingReminder(agent.session)
       if (reminder === undefined) return decision
       return { kind: 'enter', messages: [...decision.messages, reminder] }
-    }, { prepend: true })
+    }, { prepend: true }))
 
     // A rollover requested as the turn's last action still happens before the
     // next turn starts.
-    ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
+    this.mount(ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
       const pending = this.pendingRollovers.get(agent.session.id)
       if (pending === undefined || signal.aborted) return
       try {
@@ -438,17 +582,17 @@ export class RolloverController {
         const message = error instanceof Error ? error.message : String(error)
         ctx.logger.warn(`context rollover at turn stop failed: ${message}; retrying at the next boundary`)
       }
-    })
+    }))
 
-    ctx.on('agent/status', ({ agent, status }) => {
+    this.mount(ctx.on('agent/status', ({ agent, status }) => {
       if (status === 'idle') this.overflowRetries.delete(agent)
-    })
+    }))
 
     // Provider-confirmed context overflow: roll over and let the loop resend
     // the request against the checkpoint and retained tail. Also prepended:
     // recovery through a deterministic checkpoint is this plugin's whole
     // point, so it gets the same first look as pressure.
-    ctx.on('agent/request-error', async (
+    this.mount(ctx.on('agent/request-error', async (
       { agent, failure, signal },
       next,
     ) => {
@@ -466,7 +610,80 @@ export class RolloverController {
       if (signal.aborted || agent.session.surface.replaceGeneration <= generation) return next()
       this.overflowRetries.set(agent, retries + 1)
       return { kind: 'retry' }
-    }, { prepend: true })
+    }, { prepend: true }))
+  }
+
+  /**
+   * One pressure reading together with the two automatic points it is compared
+   * against.
+   *
+   * Both the notice path and the rollover path read this, so they can never
+   * disagree about where the window stands — the defect class the audit
+   * recorded as F01, where the number a user was shown and the number a
+   * decision used came from different arithmetic.
+   */
+  private pressureReading(session: Session): PressureReading | undefined {
+    const contextWindow = session.requestContext()?.contextWindow
+    if (contextWindow === undefined) return undefined
+    // The prompt the next request would submit — the quantity the window
+    // actually constrains. Not a tally: a rollover lowers it.
+    const promptTokens = measuredPromptTokens(this.ctx.tokenMeter.measure(session))
+    if (promptTokens === null) return undefined
+    const thresholdTokens = Math.floor(contextWindow * this.config.thresholdRatio)
+    const graceTokens = Math.floor(contextWindow * this.config.lastChanceRatio)
+    return {
+      promptTokens,
+      contextWindow,
+      thresholdTokens,
+      graceTokens,
+      // The band sits immediately below the rollover, so the room it reserves
+      // is the stretch the model may still use — and the rollover keeps firing
+      // exactly where it always did.
+      graceStartTokens: Math.max(0, thresholdTokens - graceTokens),
+    }
+  }
+
+  /**
+   * The last-chance notice, when this step is the model's last chance to write
+   * notes before the automatic rollover takes the window.
+   *
+   * Delivered once per window inside the band the configuration reserves below
+   * the rollover point. The rollover itself is not delayed: what the band buys
+   * is room to answer this notice, which is the step a window that is merely
+   * *reported* on never gets.
+   */
+  private pendingLastChance(session: Session): UserMessage | undefined {
+    const reading = this.pressureReading(session)
+    if (reading === undefined || reading.graceTokens <= 0) return undefined
+    if (reading.promptTokens < reading.graceStartTokens) return undefined
+    // At the rollover point the automatic path owns the step; a notice there
+    // would describe a decision already taken.
+    if (reading.promptTokens >= reading.thresholdTokens) return undefined
+    // Claimed synchronously, for the same reason the ordinary reminder is: two
+    // engine rows decide within one waterfall, before either delivery is in
+    // the log.
+    if (!claimLastChance(session)) return undefined
+    // The escalation replaces the earlier notice rather than joining it, so the
+    // window's ordinary slot is consumed here: a later step must not deliver
+    // the weaker message after the stronger one.
+    claimReminder(session)
+    const windowPercent = Math.min(100, Math.round((reading.promptTokens / reading.contextWindow) * 100))
+    return createUserMessage({
+      content: [{
+        type: 'text',
+        text: this.t('lastChance', {
+          percent: windowPercent,
+          rollover: Math.round(this.config.thresholdRatio * 100),
+          left: Math.max(0, reading.thresholdTokens - reading.promptTokens).toLocaleString('en-US'),
+        }),
+      }],
+      source: {
+        kind: 'plugin',
+        plugin: name,
+        form: 'notice',
+        summary: boundContextSummary(`${LAST_CHANCE_SUMMARY_PREFIX} (${windowPercent}% of window)`),
+      },
+    })
   }
 
   /**
@@ -474,30 +691,27 @@ export class RolloverController {
    * reminder threshold for the first time in the current window.
    */
   private pendingReminder(session: Session): UserMessage | undefined {
-    const contextWindow = session.requestContext()?.contextWindow
-    if (contextWindow === undefined) return undefined
-    const measurement = this.ctx.tokenMeter.measure(session)
-    // The prompt the next request would submit — the quantity the window
-    // actually constrains. Not a tally: a rollover lowers it.
-    const promptTokens = measuredPromptTokens(measurement)
-    if (promptTokens === null) return undefined
-    const reminderTokens = Math.floor(contextWindow * this.config.reminderThresholdRatio)
-    if (promptTokens < reminderTokens) return undefined
+    const reading = this.pressureReading(session)
+    if (reading === undefined) return undefined
+    const reminderTokens = Math.floor(reading.contextWindow * this.config.reminderThresholdRatio)
+    if (reading.promptTokens < reminderTokens) return undefined
+    // Inside the band the last-chance tier is the only notice worth sending:
+    // this one would report a countdown the model has already been told ends.
+    if (reading.graceTokens > 0 && reading.promptTokens >= reading.graceStartTokens) return undefined
     // Claimed synchronously: on a preset deployment the host row and the
     // preset row both observe this pre-step, and neither delivery is in the
     // log yet when the second one decides.
     if (!claimReminder(session)) return undefined
-    const rolloverTokens = Math.floor(contextWindow * this.config.thresholdRatio)
-    const windowPercent = Math.min(100, Math.round((promptTokens / contextWindow) * 100))
+    const windowPercent = Math.min(100, Math.round((reading.promptTokens / reading.contextWindow) * 100))
     return createUserMessage({
       content: [{
         type: 'text',
         text: this.t('reminder', {
           percent: windowPercent,
-          used: promptTokens.toLocaleString('en-US'),
-          window: contextWindow.toLocaleString('en-US'),
-          left: Math.max(0, contextWindow - promptTokens).toLocaleString('en-US'),
-          until: Math.max(0, rolloverTokens - promptTokens).toLocaleString('en-US'),
+          used: reading.promptTokens.toLocaleString('en-US'),
+          window: reading.contextWindow.toLocaleString('en-US'),
+          left: Math.max(0, reading.contextWindow - reading.promptTokens).toLocaleString('en-US'),
+          until: Math.max(0, reading.thresholdTokens - reading.promptTokens).toLocaleString('en-US'),
         }),
       }],
       source: {
@@ -510,21 +724,18 @@ export class RolloverController {
   }
 
   /**
-   * Pressure evaluation: one reminder per window below the rollover point,
-   * automatic rollover above it. Automatic pressure rollover happens at most
-   * once per turn: crossing the threshold again within the same turn means
-   * per-step re-injection plus tail exceed the threshold (a config/tail
-   * mismatch), which no rollover fixes — rolling over again would burn the
-   * prefix cache every step. Model-requested and overflow rollovers are exempt.
+   * Pressure evaluation: below the rollover point the window is described once
+   * and then, inside the last-chance band, told to checkpoint; at or above the
+   * point the rollover fires. Automatic pressure rollover happens at most once
+   * per turn: crossing the point again within the same turn means per-step
+   * re-injection plus tail exceed it (a config/tail mismatch), which no
+   * rollover fixes — rolling over again would burn the prefix cache every step.
+   * Model-requested and overflow rollovers are exempt.
    */
   private async rollOverOnPressure(agent: Agent, turn: number, signal: AbortSignal): Promise<void> {
-    const contextWindow = agent.session.requestContext()?.contextWindow
-    if (contextWindow === undefined) return
-    const measurement = this.ctx.tokenMeter.measure(agent.session)
-    const promptTokens = measuredPromptTokens(measurement)
-    if (promptTokens === null) return
-    const rolloverTokens = Math.floor(contextWindow * this.config.thresholdRatio)
-    if (promptTokens < rolloverTokens) return
+    const reading = this.pressureReading(agent.session)
+    if (reading === undefined) return
+    if (reading.promptTokens < reading.thresholdTokens) return
     if (this.pressureRolledTurns.has(turnKey(agent.session.id, turn))) {
       this.ctx.logger.warn(
         `context rollover: usage is still above the automatic threshold after this turn's pressure `
@@ -557,7 +768,7 @@ export class RolloverController {
   private shouldPreemptAutomatic(agent: Agent): boolean {
     // The per-session switch comes before every threshold question: a session
     // set to standard compaction keeps its own policy outright.
-    if (sessionMode(agent.session) !== 'rollover') return false
+    if (this.modeOf(agent.session) !== 'rollover') return false
     const other = this.otherBackend(agent)
     if (other === undefined) return true
     if (!this.config.preempt) return false
@@ -656,7 +867,12 @@ export class RolloverController {
     signal.throwIfAborted()
     const session = agent.session
     const retainTokens = this.resolveRetainTokens(session)
-    const range = selectRolloverRange(session, this.ctx.tokenMeter.measure(session), retainTokens)
+    const range = selectRolloverRange(
+      session,
+      this.ctx.tokenMeter.measure(session),
+      retainTokens,
+      this.config.pinActiveRequest,
+    )
     if (range === null) {
       this.ctx.logger.info('context rollover skipped: no compactable surface span (context is already minimal)')
       return null
@@ -744,7 +960,12 @@ export class RolloverController {
   private async checkBoundary(session: Session, handoff: string | null): Promise<BoundaryCheck> {
     try {
       const measurement = this.ctx.tokenMeter.measure(session)
-      const range = selectRolloverRange(session, measurement, this.resolveRetainTokens(session))
+      const range = selectRolloverRange(
+        session,
+        measurement,
+        this.resolveRetainTokens(session),
+        this.config.pinActiveRequest,
+      )
       if (range === null) return 'minimal'
       const notes = this.config.notesEnabled
         ? await this.notesStore(session).renderAll(this.config.handoffMaxChars)
@@ -833,6 +1054,7 @@ export class RolloverController {
         session,
         this.ctx.tokenMeter.measure(session),
         this.resolveRetainTokens(session),
+        this.config.pinActiveRequest,
       )
       if (range === null) return null
       const notes = this.config.notesEnabled
@@ -926,7 +1148,7 @@ export class RolloverController {
     if (argument !== '' && argument !== 'now') {
       return { kind: 'error', text: this.t('command.usage') }
     }
-    if (sessionMode(invocation.agent.session) !== 'rollover') {
+    if (this.modeOf(invocation.agent.session) !== 'rollover') {
       return {
         kind: 'error',
         text: this.t('manual.compactRefusal'),
@@ -961,7 +1183,7 @@ export class RolloverController {
   /** Report one mode selection as a human result. */
   private modeResult(invocation: CommandInvocation, mode: RolloverMode): CommandResult {
     const percent = Math.round(this.config.thresholdRatio * 100)
-    const modeNow = sessionMode(invocation.agent.session)
+    const modeNow = this.modeOf(invocation.agent.session)
     const applied = modeNow === mode
     const text = this.t(mode === 'rollover' ? 'mode.rollover' : 'mode.compact', { percent })
     return applied
@@ -975,19 +1197,26 @@ export class RolloverController {
   /** Report the session's effective context-management policy. */
   private modeStatus(invocation: CommandInvocation): CommandResult {
     const session = invocation.agent.session
-    const mode = sessionMode(session)
+    const mode = this.modeOf(session)
     const other = this.otherBackend(invocation.agent)
     const backendRatio = other === undefined ? undefined : readBackendThreshold(other)
     const backend = other === undefined
       ? this.t('status.self')
       : `${other.name ?? 'compaction'}${backendRatio === undefined ? '' : ` @ ${backendRatio}`}`
     const intercepting = this.shouldPreemptAutomatic(invocation.agent)
+    // The band is reported by where it opens, because that is the moment the
+    // model is told to stop and the number a human is deciding about. "off" is
+    // a different answer from "0% of the window" and has to read as one.
+    const band = this.config.lastChanceRatio <= 0
+      ? this.t('status.off')
+      : `${Math.round((this.config.thresholdRatio - this.config.lastChanceRatio) * 100)}%`
     return {
       kind: 'success',
       text: [
         `${this.t('status.mode')}: ${this.t(`mode.name.${mode}`)}`,
         `${this.t('status.rolloverAt')}: ${Math.round(this.config.thresholdRatio * 100)}%`,
         `${this.t('status.reminderAt')}: ${Math.round(this.config.reminderThresholdRatio * 100)}%`,
+        `${this.t('status.lastChanceAt')}: ${band}`,
         `${this.t('status.backend')}: ${backend}`,
         `${this.t('status.intercepting')}: ${this.t(intercepting ? 'status.yes' : 'status.no')}`,
       ].join('\n'),

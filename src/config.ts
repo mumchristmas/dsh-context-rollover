@@ -23,6 +23,27 @@ export interface RolloverConfig {
    */
   reminderThresholdRatio?: number
   /**
+   * Width of the last-chance band, as a fraction of the context window. The
+   * band sits immediately **below** {@link thresholdRatio}, so it reserves room
+   * without moving the rollover: inside it the model is told, once per window,
+   * that this is the final stretch and how much prompt growth is left before
+   * the window is replaced. `0` disables the band, which is the behavior every
+   * release before this one had. Defaults to `0.1`.
+   *
+   * Below the rollover point rather than above it on purpose: the automatic
+   * rollover has to keep firing before any other compaction backend's
+   * threshold, or a summarizer wins the session. A band that pushed the
+   * rollover later would silently do exactly that.
+   */
+  lastChanceRatio?: number
+  /**
+   * Never let a rollover shadow the newest direct human message while its turn
+   * is still open. A long autonomous turn can push the request that started it
+   * out of the retained tail; this keeps the request (and the work after it)
+   * in the fresh window at the cost of a smaller rollover. Defaults to `true`.
+   */
+  pinActiveRequest?: boolean
+  /**
    * Recent verbatim tail retained across a rollover, as a fraction of the
    * context window. Defaults to `0.1`.
    */
@@ -60,6 +81,8 @@ export interface RolloverConfig {
 export const Config: z<RolloverConfig> = z.object({
   thresholdRatio: z.number(),
   reminderThresholdRatio: z.number(),
+  lastChanceRatio: z.number(),
+  pinActiveRequest: z.boolean(),
   retainRatio: z.number(),
   retainTokens: z.number().step(1).min(0),
   handoffMaxChars: z.number().step(1).min(0),
@@ -74,6 +97,8 @@ export const Config: z<RolloverConfig> = z.object({
 export interface ResolvedRolloverConfig {
   readonly thresholdRatio: number
   readonly reminderThresholdRatio: number
+  readonly lastChanceRatio: number
+  readonly pinActiveRequest: boolean
   readonly retainRatio: number
   /** `null` keeps the ratio-based tail budget. */
   readonly retainTokens: number | null
@@ -101,16 +126,29 @@ function validateRatio(name: string, value: number): void {
 export function resolveConfig(config: RolloverConfig): ResolvedRolloverConfig {
   const thresholdRatio = config.thresholdRatio ?? 0.75
   const reminderThresholdRatio = config.reminderThresholdRatio ?? 0.6
+  const requestedLastChance = config.lastChanceRatio ?? 0.1
   const retainRatio = config.retainRatio ?? 0.1
   validateRatio('thresholdRatio', thresholdRatio)
   validateRatio('reminderThresholdRatio', reminderThresholdRatio)
   validateRatio('retainRatio', retainRatio)
+  // The band is a width, not a point: zero is the documented way to switch the
+  // last-chance protocol off, so it carries its own check rather than the
+  // strictly-positive one the other ratios use.
+  if (!Number.isFinite(requestedLastChance) || requestedLastChance < 0 || requestedLastChance > 1) {
+    throw new TypeError(`context-rollover: lastChanceRatio must be in [0, 1], got ${String(requestedLastChance)}`)
+  }
   if (reminderThresholdRatio > thresholdRatio) {
     throw new TypeError(
       `context-rollover: reminderThresholdRatio (${reminderThresholdRatio}) must not exceed `
       + `thresholdRatio (${thresholdRatio})`,
     )
   }
+  // The band reserves room *before* the rollover, so it cannot be wider than
+  // the point it sits under. That is clamped rather than refused: an existing
+  // deployment with a very low `thresholdRatio` was valid before the band
+  // existed, and a new default must not turn it into a load failure. The card
+  // refuses the pair outright, so a human never writes it on purpose.
+  const lastChanceRatio = Math.min(requestedLastChance, thresholdRatio)
   const retainTokens = config.retainTokens ?? null
   if (retainTokens !== null && (!Number.isSafeInteger(retainTokens) || retainTokens < 0)) {
     throw new TypeError(`context-rollover: retainTokens must be a non-negative integer, got ${String(retainTokens)}`)
@@ -122,6 +160,8 @@ export function resolveConfig(config: RolloverConfig): ResolvedRolloverConfig {
   return {
     thresholdRatio,
     reminderThresholdRatio,
+    lastChanceRatio,
+    pinActiveRequest: config.pinActiveRequest ?? true,
     retainRatio,
     retainTokens,
     handoffMaxChars,

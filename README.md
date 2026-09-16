@@ -61,8 +61,8 @@ You already run DSH, so hand it to the agent in a session:
 Download the latest dsh-context-rollover release asset into this working directory and install
 it into my "<profile>" profile — from the release asset, not npm — then restart that profile:
 
-  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.2.tgz
-  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.2.tgz
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.3.tgz
+  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.3.tgz
 ```
 
 By hand it is the same two commands. The profile restarts once because its plugin
@@ -75,10 +75,10 @@ The peer ranges accept every line this repository is built and tested against:
 
 | Line | Versions |
 |---|---|
-| Public compat line (npm) | `0.0.1-rc.1` … `0.0.1-rc.5` |
+| Public compat line (npm, pinned in `compat/`) | `0.1.6-alpha.1` |
 | Source line in the sibling checkout | `0.1.0-rc.x`, `0.1.5-rc.x` |
 
-Each range is written as an explicit union — `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0` —
+Each range is written as an explicit union — `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0 || >=0.1.6-alpha.1` —
 because semver only lets a prerelease satisfy a comparator whose `[major, minor, patch]`
 tuple also carries a prerelease. **A new host prerelease line has to be added to that union
 by hand**; no static range can accept an arbitrary later tuple, and
@@ -86,12 +86,52 @@ by hand**; no static range can accept an arbitrary later tuple, and
 upper bound, so a future major version installs without complaint: compatibility with a
 line is established by building and testing against it, not by the installer.
 
+`compat/` pins its packages to an exact version rather than `latest` on purpose: npm's
+`latest` tag for the `@deepseek-ai/dsh-*` packages is `0.0.1-rc.1`, so a floating spec
+silently probes an ancient line and `npm run typecheck:compat` stops being evidence. Bump
+those pins and the peer union together, then re-run `npm run compat:install`.
+
+### Running on DSH 0.1.6
+
+Two host-side changes are worth knowing before you upgrade. Neither needs a plugin change.
+
+- **Session events are reported to the official DeepSeek endpoint by default.** DSH 0.1.6
+  turned the `session-log-deepseek` row from opt-in into opt-out (`enabled` now defaults to
+  `true`, and the `base` bundle mounts the row with no override). With a DeepSeek adapter on
+  an official endpoint, each request carries the session events recorded since the last
+  accepted one — which includes this plugin's `compaction/summary` and its checkpoint
+  `user/message`, i.e. the notes and handoff text. To keep those local, set the row
+  explicitly in your profile patch:
+
+  ```yaml
+  - id: session-log-deepseek
+    name: '@deepseek-ai/dsh-session-log-deepseek'
+    config:
+      enabled: false
+  ```
+
+- **DeepSeek now defaults to the Messages protocol.** If you had pinned the old official
+  root URL by hand, remove that override or change it to
+  `https://api.deepseek.com/anthropic`. This matters here because a route that does not
+  resolve leaves `requestContext().contextWindow` unset, and with no window there is no
+  percentage to take: the reminder and the automatic rollover both stand down (an explicit
+  `/rollover now` and the model's `new_context` still work).
+
 ## Use
 
 - **It works on its own.** At 75% of the window it rolls over using the notes and the
   last messages; from 60% it reminds the model once per window to save notes and cross at
-  a clean point. A provider-confirmed context overflow forces the same rollover and
-  retries the request.
+  a clean point, and from 65% it says so in as many words: *this is the final stretch,
+  here is how much room is left, stop and write the notes*. A provider-confirmed context
+  overflow forces the same rollover and retries the request.
+- **The last chance is a real one.** The final-stretch notice arrives with 10% of the
+  window still ahead of it, so the model has room to answer it — which a window that is
+  merely *reported* on never gives. The notice does not move the rollover: it still fires
+  at 75%, before any other compaction backend's threshold, or a summarizer would win the
+  session instead.
+- **The request you are waiting on is never dropped.** A long autonomous turn can push the
+  message that started it past the retained tail; the rollover keeps that message and the
+  work after it anyway, at the cost of a smaller rollover.
 - **The model can steer it.** `new_context` asks for a boundary at the next safe point,
   `notes` is its own working memory, `history` searches what left the window, and
   `get_context_remaining` reports the numbers.
@@ -109,11 +149,11 @@ for an empty one — it is reported instead of being overwritten. Two limits are
 plainly: Node has no `openat`, so a race between resolution and open cannot be eliminated
 outright, and this is a per-session directory on one machine, not a sandbox.
 
-The rollover and reminder thresholds and the retained tail live in the **Plugin
-configuration → Context rollover** settings card (`thresholdRatio: 0.75`,
-`reminderThresholdRatio: 0.6` by default; the tail is edited in tokens, and empty means the
-deployment's share of the window, `retainRatio: 0.1`). Every knob also has a row in the
-plugin's `cordis.yml`.
+The rollover and reminder thresholds, the last-chance band, the active-request pin, and the
+retained tail live in the **Plugin configuration → Context rollover** settings card
+(`thresholdRatio: 0.75`, `reminderThresholdRatio: 0.6` and `lastChanceRatio: 0.1` by
+default; the tail is edited in tokens, and empty means the deployment's share of the
+window, `retainRatio: 0.1`). Every knob also has a row in the plugin's `cordis.yml`.
 
 ## Read the source, then file issues
 

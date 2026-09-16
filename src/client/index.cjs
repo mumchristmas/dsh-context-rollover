@@ -86,6 +86,16 @@ const DICTS = {
     'card.retainTokens.hint': 'Recent conversation kept verbatim across a rollover, counted in tokens. Empty keeps '
       + "the deployment's default, which is a share of the window.",
     'card.retainTokens.unset': 'share of window',
+    'card.lastChanceRatio': 'Last chance from (%)',
+    'card.lastChanceRatio.hint': 'The final stretch before the rollover, measured as a share of the window. On '
+      + 'entering it the model is told once that this is its last chance and how much growth is left, so it stops '
+      + 'and writes notes instead of being cut off mid-task. The rollover still fires at the threshold above. '
+      + '0 switches the notice off, which is how every release before this one behaved.',
+    'card.pinActiveRequest': 'Keep the active request',
+    'card.pinActiveRequest.hint': 'On, a rollover never drops the human message that started the open turn, even '
+      + 'when a long turn has pushed it past the retained-tail budget. It costs rollover room in exchange.',
+    'card.invalid.lastChance': 'The last chance cannot start before the window does: its width {lastChance}% must '
+      + 'not exceed the rollover threshold {threshold}%.',
     'card.handoffMaxChars': 'Handoff limit (characters)',
     'card.handoffMaxChars.hint': 'Largest handoff a model may attach to new_context. Counted in characters, not '
       + 'tokens.',
@@ -140,6 +150,14 @@ const DICTS = {
     'card.retainTokens': '保留最近对话（Token）',
     'card.retainTokens.hint': '换窗后原样保留的最近对话，按 Token 计。留空表示沿用部署默认值（窗口的 10%）。',
     'card.retainTokens.unset': '按窗口比例',
+    'card.lastChanceRatio': '最后机会起始（%）',
+    'card.lastChanceRatio.hint': '换窗之前的最后一段，按窗口比例计。进入这一段时模型会收到一次提醒：这是最后机会、还能增长多少，'
+      + '于是它可以停下来写笔记，而不是在干活的中途被切断。换窗仍然发生在上面的阈值处。填 0 表示不发这条提醒，'
+      + '也就是此前所有版本的行为。',
+    'card.pinActiveRequest': '保底保留当前请求',
+    'card.pinActiveRequest.hint': '开启后，换窗永远不会丢掉开启当前回合的那条人类消息，即使长回合已经把它挤出'
+      + '保留区。代价是单次换窗腾出的空间更少。',
+    'card.invalid.lastChance': '最后机会不能从窗口开始处就生效：它的宽度 {lastChance}% 不能超过滚动归档阈值 {threshold}%。',
     'card.handoffMaxChars': '交接文本上限（字符数）',
     'card.handoffMaxChars.hint': '模型调用 new_context 时允许附带的交接文本上限，按字符数计（不是 Token）。',
     'card.preempt': '拦截压缩',
@@ -566,6 +584,7 @@ function RolloverModeButton(props) {
  */
 const CARD_FIELDS = [
   { key: 'thresholdRatio', kind: 'percent', step: 1 },
+  { key: 'lastChanceRatio', kind: 'percent', step: 1 },
   { key: 'reminderThresholdRatio', kind: 'percent', step: 1 },
   { key: 'retainTokens', kind: 'number', min: 0, placeholderKey: 'card.retainTokens.unset' },
   { key: 'preempt', kind: 'boolean' },
@@ -583,6 +602,7 @@ const ADVANCED_FIELDS = [
   // must be able to turn it back on from the same card.
   { key: 'notesEnabled', kind: 'boolean' },
   { key: 'historyEnabled', kind: 'boolean' },
+  { key: 'pinActiveRequest', kind: 'boolean' },
   { key: 'handoffMaxChars', kind: 'number', min: 1 },
 ]
 
@@ -898,21 +918,34 @@ function RolloverSettingsCard(props) {
   const [refusal, setRefusal] = useState(undefined)
   const currentThreshold = fieldValue(snapshot, 'thresholdRatio')
   const currentReminder = fieldValue(snapshot, 'reminderThresholdRatio')
+  const currentLastChance = fieldValue(snapshot, 'lastChanceRatio')
   /**
-   * Refuse a write locally when it would make the pair incoherent, instead of
+   * Refuse a write locally when it would make a pair incoherent, instead of
    * letting the Host reject it after the input has already moved on.
    */
   const guardError = (key, next) => {
     if (typeof next !== 'number') return undefined
     const threshold = key === 'thresholdRatio' ? next : currentThreshold
     const reminder = key === 'reminderThresholdRatio' ? next : currentReminder
+    const lastChance = key === 'lastChanceRatio' ? next : currentLastChance
+    // The band is checked first: it is the pair the engine itself refuses, and
+    // a card that reported the weaker complaint would send the user to fix the
+    // wrong box.
+    if (typeof threshold === 'number' && typeof lastChance === 'number' && lastChance > threshold) {
+      // Both fields are percent controls, so the refusal has to be stated in
+      // the units the boxes show. "0.6 is not below 0.55" printed beside inputs
+      // reading 60 and 55 reads like a different pair of numbers.
+      const message = t('card.invalid.lastChance', {
+        threshold: Math.round(threshold * 100),
+        lastChance: Math.round(lastChance * 100),
+      })
+      setRefusal(message)
+      return message
+    }
     if (typeof threshold !== 'number' || typeof reminder !== 'number' || reminder <= threshold) {
       setRefusal(undefined)
       return undefined
     }
-    // Both fields are percent controls, so the refusal has to be stated in the
-    // units the boxes show. "0.6 is not below 0.55" printed beside inputs
-    // reading 60 and 55 reads like a different pair of numbers.
     const message = t('card.invalid.reminder', {
       reminder: Math.round(reminder * 100),
       threshold: Math.round(threshold * 100),

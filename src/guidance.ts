@@ -31,4 +31,9 @@ tool.
   source, or from memory: only that tool reports it, and claiming a reading you
   did not receive is a fabrication even when the guess sounds plausible.
 - A reminder near the automatic rollover point appears at most once per window.
+  The final stretch before the rollover is announced separately, once, with the
+  growth still allowed. Treat that second notice as final: do not start new work
+  on it — write the notes the next window needs and call new_context. The
+  rollover fires at the threshold whether or not notes were written, and
+  anything not in notes leaves your active context.
 `.trim()

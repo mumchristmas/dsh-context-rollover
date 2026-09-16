@@ -46,6 +46,15 @@ export const PLUGIN_NAME = 'context-rollover'
  */
 export const REMINDER_SUMMARY_PREFIX = 'context pressure reminder'
 
+/**
+ * Prefix of the last-chance notice's message summary.
+ *
+ * Deliberately not a second `REMINDER_SUMMARY_PREFIX`: the two notices are
+ * different tiers, and {@link reminderDelivered} has to tell them apart or the
+ * weaker one would suppress the stronger.
+ */
+export const LAST_CHANCE_SUMMARY_PREFIX = 'context pressure last-chance'
+
 /** The compaction/summary `provider` value written by this backend. */
 export const ROLLOVER_PROVIDER = 'dsh-context-rollover'
 
@@ -172,12 +181,53 @@ export interface CommitRolloverOptions {
 }
 
 /**
+ * The surface index of the request the open turn is serving.
+ *
+ * Only the newest direct human message counts, and only while its turn is still
+ * open: that is the one instruction a fresh window would otherwise lose the
+ * moment a single turn's own work grows past the tail budget. A human message
+ * from a turn that already closed is history — notes are its carrier, and
+ * pinning it would retain every turn since.
+ * @param session - session supplying the authoritative log and surface.
+ * @param surfaceNodes - the current surface positions, ascending.
+ * @returns the surface index of the open turn's human message, or `undefined`
+ *   when no turn is open, the turn has no human message yet, or that message is
+ *   no longer on the surface.
+ */
+function openTurnRequestIdx(session: Session, surfaceNodes: readonly Seq[]): number | undefined {
+  let openTurnStart: Seq | undefined
+  for (let seq = session.seq - 1; seq >= 0; seq -= 1) {
+    const event = sessionEventAt(session, seq)
+    if (event === undefined) continue
+    if (event.type === 'turn/start') {
+      openTurnStart = event.seq
+      break
+    }
+    if (event.type === 'turn/end') return undefined
+  }
+  if (openTurnStart === undefined) return undefined
+  for (let index = surfaceNodes.length - 1; index >= 0; index -= 1) {
+    const seq = surfaceNodes[index]
+    // Surface positions ascend, so the first one below the turn start proves
+    // the turn contributed no human message of its own.
+    if (seq === undefined || seq < openTurnStart) return undefined
+    const event = sessionEventAt(session, seq)
+    if (event === undefined || event.type !== 'user/message') continue
+    if ((event.data.source as { kind?: unknown }).kind === 'user') return index
+  }
+  return undefined
+}
+
+/**
  * Select the replacement range for a rollover: everything except a token-
  * budgeted recent tail, with the cut moved backward until it does not split
  * an assistant tool-call/result pair.
  * @param session - session supplying authoritative current surface positions.
  * @param measurement - unified pressure and surface measurement from the meter.
  * @param retainTokens - minimum recent tail budget retained verbatim.
+ * @param pinActiveRequest - keep the open turn's human message out of the
+ *   replaced span even when the tail budget would have taken it. Defaults to
+ *   `true`; `false` restores the pre-existing purely budgeted cut.
  * @returns the inclusive positional seq range to replace, or `null` when the
  *   surface has no usable compactable span (nothing would be freed).
  */
@@ -185,6 +235,7 @@ export function selectRolloverRange(
   session: Session,
   measurement: TokenMeasurement,
   retainTokens: number,
+  pinActiveRequest = true,
 ): { start: Seq; end: Seq; shadowedSeqs: readonly Seq[] } | null {
   const pricedNodes = measurement.nodes
   if (pricedNodes.length === 0) return null
@@ -210,6 +261,24 @@ export function selectRolloverRange(
   const head = first === undefined ? undefined : sessionEventAt(session, first)
   const firstIdx = head !== undefined && (head.type as string) === 'system/message' ? 1 : 0
   if (keepFromIdx === undefined || keepFromIdx <= firstIdx) return null
+
+  // The active request is not a tail-budget question. Retaining from it also
+  // retains everything the turn has done since, which is exactly the working
+  // context a fresh window needs; a turn that never produced a human message
+  // yields no pin, and one whose message is already inside the tail is left to
+  // the budget.
+  //
+  // The pin is a preference, not a veto. When there is nothing before the
+  // request to replace — the whole surface is this one turn — honouring it
+  // would leave no span at all, and a session that can never roll over is worse
+  // than one that rolled over and was explicit about what it dropped. The
+  // budgeted cut stands there, exactly as it did before the pin existed.
+  if (pinActiveRequest) {
+    const pinnedIdx = openTurnRequestIdx(session, surfaceNodes)
+    if (pinnedIdx !== undefined && pinnedIdx > firstIdx && pinnedIdx < keepFromIdx) {
+      keepFromIdx = pinnedIdx
+    }
+  }
 
   while (keepFromIdx > firstIdx) {
     const candidate = surfaceNodes[keepFromIdx]
@@ -474,14 +543,25 @@ export function rolloverSummarySeqs(session: Session): Seq[] {
  */
 const CLAIM_KEY = Symbol.for('dsh.context-rollover.reminder-claims')
 
-/** The claimed window numbers on one session, created on first use. */
-function claimsOn(session: Session): Set<number> {
+/**
+ * The last-chance tier's own registry key.
+ *
+ * A separate symbol rather than a second set under {@link CLAIM_KEY}: a session
+ * object is shared with every other loaded copy of this module, and one that
+ * predates the last-chance tier would find a shape it does not recognize under
+ * the old key. A new key is additive, so an older copy keeps working next to a
+ * newer one instead of throwing on `Set.has` of a foreign object.
+ */
+const LAST_CHANCE_CLAIM_KEY = Symbol.for('dsh.context-rollover.last-chance-claims')
+
+/** The claimed window numbers on one session under one registry key. */
+function claimsOn(session: Session, key: symbol): Set<number> {
   const carrier = session as unknown as Record<symbol, unknown>
-  const existing = carrier[CLAIM_KEY]
+  const existing = carrier[key]
   if (existing instanceof Set) return existing as Set<number>
   const created = new Set<number>()
   try {
-    Object.defineProperty(session, CLAIM_KEY, {
+    Object.defineProperty(session, key, {
       value: created,
       enumerable: false,
       configurable: true,
@@ -532,6 +612,41 @@ export function isPressureReminder(event: SessionEvent): event is SessionEvent<'
 }
 
 /**
+ * The one definition of "this event is the last-chance notice".
+ *
+ * Built exactly like {@link isPressureReminder} so the two tiers can never be
+ * confused: same plugin attribution, same `notice` form, different summary
+ * prefix. A weaker predicate here would let a last-chance notice consume the
+ * ordinary reminder's slot, or the reverse.
+ * @param event - one logged session event.
+ * @returns true when the event is this engine's last-chance notice, narrowing
+ *   the event to a `user/message` for the caller.
+ */
+export function isLastChanceNotice(event: SessionEvent): event is SessionEvent<'user/message'> {
+  if (event.type !== 'user/message') return false
+  const { source } = event.data
+  return source.kind === 'plugin'
+    && 'plugin' in source
+    && source.plugin === PLUGIN_NAME
+    && source.form === 'notice'
+    && source.summary.startsWith(LAST_CHANCE_SUMMARY_PREFIX)
+}
+
+/**
+ * Whether an event is any notice this engine delivers into the transcript.
+ *
+ * Both tiers are regenerable plugin state rather than conversation, so every
+ * consumer that excludes the reminder from recoverable history has to exclude
+ * the last-chance notice too — and reads that fact from here, not from a list
+ * of its own that would drift the moment a tier is added.
+ * @param event - one logged session event.
+ * @returns true when the event is one of this engine's context notices.
+ */
+export function isContextNotice(event: SessionEvent): boolean {
+  return isPressureReminder(event) || isLastChanceNotice(event)
+}
+
+/**
  * Whether a pressure reminder was already delivered in the session's current
  * window, according to the durable log.
  *
@@ -549,6 +664,19 @@ export function reminderDelivered(session: Session): boolean {
 }
 
 /**
+ * Whether the last-chance notice was already delivered in the session's current
+ * window, according to the durable log. The tier's counterpart to
+ * {@link reminderDelivered}, with the same authority.
+ * @param session - session to inspect.
+ * @returns true when the current window already carries the notice.
+ */
+export function lastChanceDelivered(session: Session): boolean {
+  const windowStart = (rolloverSummarySeqs(session).at(-1) ?? -1) + 1
+  return sessionEvents(session)
+    .some(event => event.seq >= windowStart && isLastChanceNotice(event))
+}
+
+/**
  * Claim the current window's reminder slot, if nobody has yet.
  *
  * Claiming is synchronous on purpose: two engine rows can decide within one
@@ -558,7 +686,25 @@ export function reminderDelivered(session: Session): boolean {
  */
 export function claimReminder(session: Session): boolean {
   if (reminderDelivered(session)) return false
-  const claimed = claimsOn(session)
+  const claimed = claimsOn(session, CLAIM_KEY)
+  const windowNumber = countRollovers(session)
+  if (claimed.has(windowNumber)) return false
+  claimed.add(windowNumber)
+  return true
+}
+
+/**
+ * Claim the current window's last-chance slot, if nobody has yet.
+ *
+ * Independent of {@link claimReminder} on purpose: the two tiers are delivered
+ * at different pressures, and a window that never crossed the reminder point
+ * still gets its last chance.
+ * @param session - session whose window to claim.
+ * @returns true when this caller owns the last-chance notice for the window.
+ */
+export function claimLastChance(session: Session): boolean {
+  if (lastChanceDelivered(session)) return false
+  const claimed = claimsOn(session, LAST_CHANCE_CLAIM_KEY)
   const windowNumber = countRollovers(session)
   if (claimed.has(windowNumber)) return false
   claimed.add(windowNumber)
@@ -573,7 +719,8 @@ export function claimReminder(session: Session): boolean {
  * @param session - session whose claims to drop.
  */
 export function resetReminderClaims(session: Session): void {
-  claimsOn(session).clear()
+  claimsOn(session, CLAIM_KEY).clear()
+  claimsOn(session, LAST_CHANCE_CLAIM_KEY).clear()
   fallbackClaims.delete(session)
 }
 

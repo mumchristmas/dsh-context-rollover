@@ -209,7 +209,7 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ContextRolloverEngine } from '../src/index.ts'
-import { isPressureReminder } from '../src/rollover.ts'
+import { isLastChanceNotice, isPressureReminder } from '../src/rollover.ts'
 import type { RolloverConfig } from '../src/config.ts'
 
 /** A notes base directory for one test. */
@@ -274,6 +274,20 @@ export function errorFinish(message: string, code: string): StreamChunk[] {
 export function reminderTexts(session: Session): string[] {
   return session.snapshotEvents()
     .filter(isPressureReminder)
+    .map(event => event.data.content[0])
+    .filter(block => block?.type === 'text')
+    .map(block => block?.type === 'text' ? block.text : '')
+}
+
+/**
+ * The last-chance notice texts in the durable log, read through the engine's
+ * own predicate for the same reason {@link reminderTexts} is: a test that
+ * classified notices by itself could disagree with the engine about which tier
+ * was delivered.
+ */
+export function lastChanceTexts(session: Session): string[] {
+  return session.snapshotEvents()
+    .filter(isLastChanceNotice)
     .map(event => event.data.content[0])
     .filter(block => block?.type === 'text')
     .map(block => block?.type === 'text' ? block.text : '')

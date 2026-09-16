@@ -86,6 +86,18 @@ describe('get_context_remaining discoverability', () => {
     expect(text).not.toMatch(/used_tokens/)
     expect(text).not.toMatch(/Context used/i)
 
+    // A payload missing an optional reading still renders: the absent field is
+    // skipped, never printed as a fabricated zero, and never throws.
+    const partial = (render?.({}, {
+      prompt_tokens: 15255,
+      context_window: 32000,
+      rollover_tokens_left: 13545,
+    }) ?? []).map(line => line.text).join('\n')
+    expect(partial).toBe([
+      'prompt used   15,255 / 32,000 (48%)',
+      'rollover in   13,545',
+    ].join('\n'))
+
     // Unmeasured is stated as unmeasured, never as a number.
     const empty = (render?.({}, {
       prompt_tokens: null,
@@ -93,6 +105,7 @@ describe('get_context_remaining discoverability', () => {
       context_window: 32000,
       prompt_tokens_left: null,
       rollover_tokens_left: null,
+      grace_tokens_left: null,
     }) ?? []).map(line => line.text).join('\n')
     expect(empty).toBe('not measured yet')
     expect(empty).not.toMatch(/[0-9]/)

@@ -116,9 +116,12 @@ describe('peer ranges', () => {
     // semver only lets a prerelease satisfy a comparator whose [major, minor,
     // patch] tuple also carries a prerelease, so no static range can accept an
     // arbitrary later tuple. This is the documented limit, not a regression:
-    // a new host line has to be added to the enumeration.
-    expect(semver.satisfies('0.1.6-rc.1', rule)).toBe(false)
-    expect(semver.satisfies('0.1.6', rule)).toBe(true)
+    // a new host line has to be added to the enumeration. 0.1.6-alpha.1 is the
+    // newest enumerated line, so 0.1.7 is the next one that will need adding —
+    // and a prerelease *of an enumerated tuple* (0.1.6-rc.1) is already accepted.
+    expect(semver.satisfies('0.1.7-rc.1', rule)).toBe(false)
+    expect(semver.satisfies('0.1.7', rule)).toBe(true)
+    expect(semver.satisfies('0.1.6-rc.1', rule)).toBe(true)
   })
 })
 

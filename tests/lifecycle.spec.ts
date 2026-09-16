@@ -82,11 +82,14 @@ describe('requested boundary honesty', () => {
       rollOverOnPressure: (...args: unknown[]) => Promise<void>
     }
     // A threshold this low makes the pressure path eligible on its own, and the
-    // queued handoff is far too large for the commit to shrink.
+    // queued handoff is far too large for the commit to shrink. The band is
+    // switched off so the reading lands past the forced point immediately —
+    // this case is about the safety net, not about the wait before it.
     controller.effective = {
       ...engine.controller.config,
       thresholdRatio: 0.001,
       reminderThresholdRatio: 0.001,
+      lastChanceRatio: 0,
     }
     controller.pendingRollovers.set(session.id, { handoff: 'handoff '.repeat(2490) })
 

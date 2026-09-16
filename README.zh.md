@@ -54,8 +54,8 @@
 请把 dsh-context-rollover 的最新 release 附件下载到当前工作目录，并把它装进我的
 "<profile>" profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
 
-  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.2.tgz
-  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.2.tgz
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.3.tgz
+  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.3.tgz
 ```
 
 手工执行就是同样两条命令。因为插件组合变了，profile 需要重启一次；之后 **设置 → 插件配置**
@@ -67,20 +67,52 @@ peer 范围接受本仓库实际构建并测试过的每一条线：
 
 | 线 | 版本 |
 |---|---|
-| 公开 compat 线（npm） | `0.0.1-rc.1` … `0.0.1-rc.5` |
+| 公开 compat 线（npm，`compat/` 中钉死） | `0.1.6-alpha.1` |
 | 同级 checkout 的源码线 | `0.1.0-rc.x`、`0.1.5-rc.x` |
 
-每条范围都写成显式并集 —— `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0` —— 因为 semver
+每条范围都写成显式并集 —— `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0 || >=0.1.6-alpha.1` —— 因为 semver
 只允许预发布版本满足「`[major, minor, patch]` 三元组本身也带预发布」的比较符。**新增一条宿主
 预发布线必须手工加进这个并集**；没有任何静态范围能接受任意靠后的三元组，`tests/metadata.spec.ts`
 同时钉住了已接受的线和这一限制。范围不带上限，所以未来的大版本会照常安装：与某条线的兼容性由
 「针对它构建并测试」确立，而不是由安装器决定。
 
+`compat/` 里的包刻意钉死到具体版本而不是 `latest`：npm 上 `@deepseek-ai/dsh-*` 的 `latest`
+标签是 `0.0.1-rc.1`，浮动写法会静默地针对一条远古线做检查，`npm run typecheck:compat`
+也就不再是证据。改这些钉死的版本和上面的 peer 并集要同步进行，然后重跑
+`npm run compat:install`。
+
+### 在 DSH 0.1.6 上运行
+
+升级前有两处宿主侧变化值得知道。两处都不需要改插件。
+
+- **会话事件默认上报到 DeepSeek 官方端点。** DSH 0.1.6 把 `session-log-deepseek` 这一行从
+  选择加入改成了默认开启（`enabled` 现在默认 `true`，且 `base` bundle 挂载该行时没有覆盖
+  配置）。当使用 DeepSeek 适配器连接官方端点时，每次请求都会携带「上次确认之后」记录的会话
+  事件 —— 其中包含本插件写入的 `compaction/summary` 与 checkpoint `user/message`，也就是你的
+  笔记与 handoff 文本。若要留在本地，在 profile patch 里显式关掉该行：
+
+  ```yaml
+  - id: session-log-deepseek
+    name: '@deepseek-ai/dsh-session-log-deepseek'
+    config:
+      enabled: false
+  ```
+
+- **DeepSeek 默认改用 Messages 协议。** 如果你手工钉过旧的官方根地址，请移除该覆盖，或改成
+  `https://api.deepseek.com/anthropic`。这件事在这里有影响，是因为路由解析失败会让
+  `requestContext().contextWindow` 取不到值，而没有窗口就没有百分比可算：提醒与自动滚动都会
+  自行让位（显式的 `/rollover now` 和模型的 `new_context` 仍然可用）。
+
 ## 怎么用
 
 - **它会自己工作。** 窗口用到 75% 时，它带着笔记和最近消息自动滚动；从 60% 起，它每
-  窗口提醒模型一次：保存笔记、在干净的节点跨过边界。provider 确认的上下文超限会强制
-  执行同样的滚动，并重试请求。
+  窗口提醒模型一次：保存笔记、在干净的节点跨过边界；从 65% 起它会把话说白：**这是最后一段，
+  还剩多少空间，停下来把笔记写完**。provider 确认的上下文超限会强制执行同样的滚动，并重试请求。
+- **最后机会是真的。** 最后一段的提醒到来时，前面还留着窗口 10% 的空间，模型有地方回应它 ——
+  仅仅被"告知"过窗口快满的会话从来没有这一步。这条提醒**不移动滚动点**：滚动仍然在 75% 触发，
+  早于其它压缩后端的阈值，否则赢下这个会话的会是摘要。
+- **你正在等的那个请求不会被丢掉。** 一个很长的自主回合会把开启它的那条消息挤出保留尾部；
+  换窗依然会保住那条消息以及它之后的工作，代价是单次换窗腾出的空间更少。
 - **模型可以主动控制。** `new_context` 请求在下一个安全点开新窗口，`notes` 是它自己的
   工作记忆，`history` 检索已经离开窗口的对话，`get_context_remaining` 报告数字。
 - **你也可以控制。** `/rollover on | off | status | now`，或者会话统计行里的图标按钮
@@ -95,8 +127,8 @@ peer 范围接受本仓库实际构建并测试过的每一条线：
 覆盖。两条限制需要说明白：Node 没有 `openat`，解析与打开之间的竞态无法彻底消除；这是单机上的
 按会话目录，不是沙箱。
 
-滚动阈值、提醒阈值和保留尾部在 **Plugin configuration → Context rollover** 设置卡片里
-（默认 `thresholdRatio: 0.75`、`reminderThresholdRatio: 0.6`；保留尾部按 Token 编辑，
+滚动阈值、提醒阈值、最后机会宽度和保留尾部在 **Plugin configuration → Context rollover** 设置卡片里
+（默认 `thresholdRatio: 0.75`、`reminderThresholdRatio: 0.6`、`lastChanceRatio: 0.1`；保留尾部按 Token 编辑，
 留空表示沿用部署配置里按窗口比例保留的默认值 `retainRatio: 0.1`）。每一项也都能写在插件行
 的 `cordis.yml` 里。
 

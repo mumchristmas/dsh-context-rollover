@@ -52,6 +52,10 @@ describe('pressure accounting', () => {
       thresholdRatio: 0.9,
       reminderThresholdRatio: 0.75,
       retainTokens: 0,
+      // The case pins where the *forced* rollover fires, so the last-chance
+      // band is out of scope: with it on, the same reading would hold the
+      // window open for the band's width.
+      lastChanceRatio: 0,
     })
     // A first request large enough that the boundary has real content to
     // shadow, answered with 8,000 tokens on top of an 85,000-token prompt.

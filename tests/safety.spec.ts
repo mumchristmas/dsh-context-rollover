@@ -52,6 +52,9 @@ describe('automatic pressure rollover', () => {
       // is already met there and the shadow covers the whole middle span
       // (everything but the system head and the tail).
       retainTokens: 0,
+      // What the shadowed span contains is this case's subject, not when the
+      // crossing happens, so the last-chance band stays out of it.
+      lastChanceRatio: 0,
     })
     // Long answers so the shadowed span's priced surface dwarfs the
     // checkpoint (the shrink guard compares heuristic node pricing). Turn two
@@ -98,6 +101,9 @@ describe('pressure anti-thrash', () => {
       thresholdRatio: 0.002,
       reminderThresholdRatio: 0.001,
       retainTokens: 40,
+      // The guard, not the crossing point, is the subject: the band would put
+      // both pre-steps inside it and neither would reach the rollover.
+      lastChanceRatio: 0,
     })
     // Turn 1 anchors usage (2000 >= the ~1100 heuristic estimate, so the
     // meter trusts it). Turn 2 makes TWO model requests (a get_context_remaining

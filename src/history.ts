@@ -20,7 +20,7 @@ import { isCompactCheckpointSource } from '@deepseek-ai/dsh-compaction'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Seq } from './compat.ts'
 import { sessionEventAt, sessionEvents } from './compat.ts'
-import { isPressureReminder } from './rollover.ts'
+import { isContextNotice } from './rollover.ts'
 
 /** Which kind of surface event one history item came from. */
 export type HistoryItemKind = 'user' | 'assistant' | 'tool-result' | 'agent'
@@ -187,7 +187,8 @@ interface RecoveredItem {
  * reports, team messages, session references, and whatever a future plugin
  * adds) and an allow-list silently drops each new one. Only state this plugin
  * or the compaction transaction regenerates is left out: a rollover checkpoint
- * and a pressure reminder are reproducible notices, not conversation.
+ * and either context notice (the pressure reminder, the last-chance notice) are
+ * reproducible notices, not conversation.
  * @param event - one logged session event.
  * @returns the recovered item, or `null` when there is nothing to recover.
  */
@@ -199,7 +200,7 @@ function recoverEvent(event: SessionEvent): RecoveredItem | null {
       // `never` for the payload it was already narrowed to.
       const { content, source: rawSource } = event.data
       if (isCompactCheckpointSource(rawSource)) return null
-      if (isPressureReminder(event)) return null
+      if (isContextNotice(event)) return null
       const source = rawSource as SourceShape
       const kind = typeof source.kind === 'string' ? source.kind : ''
       const text = messageText(content as unknown as readonly BlockShape[])

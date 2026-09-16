@@ -1,5 +1,8 @@
 node_modules/
 lib/
+# Benchmark libraries are source, not compiled output.
+!bench/lib/
+!bench/lib/**
 tsconfig.dsh-paths.json
 tsconfig.build-paths.json
 tsconfig.compat-paths.json
@@ -7,3 +10,7 @@ tsconfig.compat-paths.json
 # Local working notes and scratch output
 audit/
 audit-workspace/
+
+# Isolated benchmark runtime, fixtures, and session artifacts (never production state)
+.bench/
+.bench-test-*/

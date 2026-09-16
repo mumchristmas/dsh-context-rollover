@@ -211,7 +211,12 @@ function loadClient(): {
         observed: [{ name: 'compaction-basic', thresholdRatio: 0.8 }],
         presets: ['standard'],
         stockThresholdRatio: 0.8,
-        self: { thresholdRatio: 0.75, reminderThresholdRatio: 0.6, preempt: true },
+        self: {
+          thresholdRatio: 0.75,
+          reminderThresholdRatio: 0.6,
+          lastChanceRatio: 0.1,
+          preempt: true,
+        },
         safeBelow: 0.8,
       }),
     })
@@ -265,6 +270,7 @@ function fakeScope(): FakeScope {
   const base: Record<string, unknown> = {
     thresholdRatio: 0.75,
     reminderThresholdRatio: 0.6,
+    lastChanceRatio: 0.1,
     retainRatio: 0.1,
     preempt: true,
   }
@@ -440,11 +446,12 @@ describe('settings card', () => {
     expect(elementsOf(expanded).some(element =>
       String(element.props['className'] ?? '').includes('dsh-open'))).toBe(true)
     const inputs = elementsOf(expanded).filter(element => element.type === 'input')
-    // Four policy fields on the surface: three percentages plus the switch.
-    expect(inputs).toHaveLength(4)
+    // Five policy fields on the surface: four percentages plus the switch.
+    expect(inputs).toHaveLength(5)
     const labels = inputs.map(input => input.props['aria-label'])
     expect(labels).toEqual([
       'T:card.thresholdRatio',
+      'T:card.lastChanceRatio',
       'T:card.reminderThresholdRatio',
       'T:card.retainTokens',
       'T:card.preempt',
@@ -453,11 +460,13 @@ describe('settings card', () => {
     // touched still shows the effective number rather than an empty box.
     const threshold = inputs[0]
     expect(threshold?.props['value']).toBe('90')
-    const reminder = inputs[1]
+    const lastChance = inputs[1]
+    expect(lastChance?.props['value']).toBe('10')
+    const reminder = inputs[2]
     expect(reminder?.props['value']).toBe('60')
     // Retention is the one control whose empty state is meaningful: empty means
     // "keep the deployment's share of the window".
-    const retention = inputs[2]
+    const retention = inputs[3]
     expect(retention?.props['value']).toBe('')
     expect(retention?.props['placeholder']).toBe('T:card.retainTokens.unset')
     // Explanations live on the info button, not on the surface.
@@ -484,11 +493,13 @@ describe('settings card', () => {
     const withAdvanced = elementsOf(loaded.render(card.component, props)).filter(element => element.type === 'input')
     expect(withAdvanced.map(input => input.props['aria-label'])).toEqual([
       'T:card.thresholdRatio',
+      'T:card.lastChanceRatio',
       'T:card.reminderThresholdRatio',
       'T:card.retainTokens',
       'T:card.preempt',
       'T:card.notesEnabled',
       'T:card.historyEnabled',
+      'T:card.pinActiveRequest',
       'T:card.handoffMaxChars',
     ])
   })
@@ -551,11 +562,13 @@ describe('settings card', () => {
     expect(loaded.scope.mutations).toHaveLength(1)
     expect(loaded.scope.mutations[0]).toEqual([
       { op: 'unset', path: ['thresholdRatio'] },
+      { op: 'unset', path: ['lastChanceRatio'] },
       { op: 'unset', path: ['reminderThresholdRatio'] },
       { op: 'unset', path: ['retainTokens'] },
       { op: 'unset', path: ['preempt'] },
       { op: 'unset', path: ['notesEnabled'] },
       { op: 'unset', path: ['historyEnabled'] },
+      { op: 'unset', path: ['pinActiveRequest'] },
       { op: 'unset', path: ['handoffMaxChars'] },
     ])
   })

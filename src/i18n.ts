@@ -50,14 +50,21 @@ export const HOST_DICTIONARIES: Readonly<Record<PluginLocale, Readonly<Record<st
     'status.mode': 'mode',
     'status.rolloverAt': 'rollover at',
     'status.reminderAt': 'reminder at',
+    'status.lastChanceAt': 'last chance from',
     'status.backend': 'backend',
     'status.intercepting': 'intercepting',
     'status.yes': 'yes',
     'status.no': 'no',
     'status.self': 'this plugin (no other backend mounted)',
+    'status.off': 'off',
     'reminder': 'Context window {percent}%: prompt used {used} / {window}, window left {left}, automatic rollover '
       + 'in {until}. At a task boundary, save notes and call new_context with a short handoff; otherwise '
       + 'checkpoint soon.',
+    'lastChance': 'Context window {percent}%: this is the final stretch. The automatic rollover fires when this '
+      + 'window reaches {rollover}%, which leaves {left} more tokens of prompt growth. Do not start new work. '
+      + 'Write what the next window needs into notes now — goal, verified progress, decisions, constraints, files '
+      + 'involved, known failures, next steps — then call new_context with a short handoff. Anything not in notes '
+      + 'leaves your active context when the rollover fires.',
   },
   zh: {
     'command.description': '在滚动归档与标准压缩之间切换本会话，或立即开一个新窗口',
@@ -80,13 +87,19 @@ export const HOST_DICTIONARIES: Readonly<Record<PluginLocale, Readonly<Record<st
     'status.mode': '模式',
     'status.rolloverAt': '滚动归档阈值',
     'status.reminderAt': '提醒阈值',
+    'status.lastChanceAt': '最后机会起始于',
     'status.backend': '后端',
     'status.intercepting': '是否拦截',
     'status.yes': '是',
     'status.no': '否',
     'status.self': '本插件（没有其它后端挂载）',
+    'status.off': '关闭',
     'reminder': '上下文窗口 {percent}%：已用 {used} / {window}，剩余 {left}，距自动滚动归档 {until}。'
       + '到了阶段边界就保存笔记并用简短交接调用 new_context；否则尽快打检查点。',
+    'lastChance': '上下文窗口 {percent}%：这是最后一段。窗口到 {rollover}% 时自动滚动归档就会执行，'
+      + '也就是说还能再增长 {left} Token。不要再开始新工作。现在就把下一个窗口需要的内容写进笔记——目标、已验证的进展、'
+      + '决定、约束、涉及的文件、已知的失败、下一步——然后用简短交接调用 new_context。'
+      + '没写进笔记的内容会随着换窗离开你的活动上下文。',
   },
 }
 
