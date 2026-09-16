@@ -72,19 +72,30 @@ describe('settings section', () => {
     await settle()
     expect(controller.config.thresholdRatio).toBe(0.75)
 
-    // A reminder above the rollover point is incoherent: the write is refused
-    // rather than stored for the next rollover to trip over.
-    await expect(async () => await ctx.settings.update(SETTINGS_NAMESPACE, {
-      thresholdRatio: 0.5,
-      reminderThresholdRatio: 0.9,
-    })).rejects.toThrow(/must not exceed/)
+    // A ratio the engine has no meaning for is refused before it is stored.
+    await expect(async () => await ctx.settings.update(SETTINGS_NAMESPACE, { thresholdRatio: 1.5 }))
+      .rejects.toThrow(/in \(0, 1\]/)
     expect(controller.config.thresholdRatio).toBe(0.75)
 
-    // An accepted write re-resolves the effective configuration in place. It
-    // must stay above the reminder point (0.6 from the composition layer).
+    // A reminder above the rollover point is *reconciled* rather than refused:
+    // the scope hands the engine the whole effective configuration, so refusing
+    // here would also refuse the single-field threshold edit below — the user
+    // would be blocked by a reminder they never chose. What survives is the
+    // ordering the reminder needs in order to be delivered at all.
+    await ctx.settings.update(SETTINGS_NAMESPACE, {
+      thresholdRatio: 0.5,
+      reminderThresholdRatio: 0.9,
+    })
+    expect(controller.config.thresholdRatio).toBe(0.5)
+    expect(controller.config.reminderThresholdRatio)
+      .toBeLessThanOrEqual(controller.config.lastChanceRatio)
+
+    // A single-field edit re-resolves in place, and the inherited reminder
+    // yields to the room the lower threshold leaves instead of blocking it.
     await ctx.settings.update(SETTINGS_NAMESPACE, { thresholdRatio: 0.65 })
     expect(controller.config.thresholdRatio).toBe(0.65)
-    expect(controller.config.reminderThresholdRatio).toBe(0.6)
+    expect(controller.config.reminderThresholdRatio)
+      .toBeLessThanOrEqual(controller.config.lastChanceRatio)
 
     // Clearing the user section returns every field to the composition layer.
     await ctx.settings.replace(SETTINGS_NAMESPACE, {})

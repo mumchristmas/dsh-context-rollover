@@ -194,7 +194,9 @@ describe('pinned active request, end to end', () => {
       reminderThresholdRatio: 0.4,
       // The band is not this case's subject; the forced rollover has to fire
       // the moment the reading crosses.
-      lastChanceRatio: 0,
+      // Collapsed onto the rollover point: the tier is off, as in every release
+      // before the ladder existed. The threshold here is 0.5.
+      lastChanceRatio: 0.5,
       retainTokens: 40,
       pinActiveRequest,
     })

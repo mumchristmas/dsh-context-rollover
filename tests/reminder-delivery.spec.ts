@@ -110,7 +110,9 @@ describe('pressure reminder delivery', () => {
       // Claim slots advance with the window, and the case is about the window
       // boundary, not about when the boundary is reached: the band would only
       // move the crossing later without changing what is being tested.
-      lastChanceRatio: 0,
+      // Collapsed onto the rollover point: the tier is off, as in every release
+      // before the ladder existed. The threshold here is 0.001.
+      lastChanceRatio: 0.001,
     })
     const adapter = new ScriptedAdapter([
       usageResponse(`research answer one ${'detail '.repeat(600)}`, 5000),

@@ -126,7 +126,12 @@ describe('preset ownership', () => {
     const defaults = resolveConfig({})
     expect(defaults.thresholdRatio).toBeLessThan(0.8)
     expect(defaults.reminderThresholdRatio).toBeLessThanOrEqual(defaults.thresholdRatio)
-    expect(() => resolveConfig({ thresholdRatio: 0.5, reminderThresholdRatio: 0.9 }))
-      .toThrow(/must not exceed/)
+    // The ladder is reconciled against the threshold rather than refused, so
+    // the ordering the engine depends on holds for whatever pair a settings
+    // scope hands over — including a reminder stated above a lowered rollover.
+    const reconciled = resolveConfig({ thresholdRatio: 0.5, reminderThresholdRatio: 0.9 })
+    expect(reconciled.reminderThresholdRatio).toBeLessThanOrEqual(reconciled.lastChanceRatio)
+    expect(reconciled.lastChanceRatio).toBeLessThanOrEqual(reconciled.thresholdRatio)
+    expect(() => resolveConfig({ thresholdRatio: 1.5 })).toThrow(/in \(0, 1\]/u)
   })
 })

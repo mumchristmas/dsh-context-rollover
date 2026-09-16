@@ -55,7 +55,9 @@ describe('pressure accounting', () => {
       // The case pins where the *forced* rollover fires, so the last-chance
       // band is out of scope: with it on, the same reading would hold the
       // window open for the band's width.
-      lastChanceRatio: 0,
+      // Collapsed onto the rollover point: the tier is off, as in every release
+      // before the ladder existed. The threshold here is 0.9.
+      lastChanceRatio: 0.9,
     })
     // A first request large enough that the boundary has real content to
     // shadow, answered with 8,000 tokens on top of an 85,000-token prompt.

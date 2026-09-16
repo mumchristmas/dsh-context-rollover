@@ -44,13 +44,15 @@ import {
 } from './harness.ts'
 
 /**
- * The rollover fires at 60% of the mock's 100,000-token window, and the last
- * chance opens at 50%: a 10% band, with the ordinary reminder at 40% below it.
+ * Three points on the mock's 100,000-token window: the rollover fires at 60%,
+ * the last chance opens at 50%, and the ordinary reminder fires at 40%. The 10%
+ * stretch between the last two is derived, not configured — the fixture states
+ * positions like every other tier.
  */
 const BANDED = {
   thresholdRatio: 0.6,
   reminderThresholdRatio: 0.4,
-  lastChanceRatio: 0.1,
+  lastChanceRatio: 0.5,
   retainTokens: 0,
 } as const
 
@@ -186,12 +188,13 @@ describe('last-chance band', () => {
     expect(lastChanceTexts(session)).toHaveLength(2)
   })
 
-  it('reproduces the pre-band behavior exactly when the band is switched off', async () => {
-    // The contrast case for the first one: the same reading, one config flag
-    // apart. Without a band there is no final stretch, so 55,000 is simply
-    // below the threshold and the ordinary reminder is the only notice.
-    const read = async (label: string, lastChanceRatio: number): Promise<Session> => {
-      const { ctx, agent, session } = await engineHarness(sessionId(label), { ...BANDED, lastChanceRatio })
+  it('reproduces the pre-band behavior exactly when the tier is switched off', async () => {
+    // The contrast case for the first one: the same reading, one config value
+    // apart. A last-chance point collapsed onto the rollover point leaves no
+    // final stretch, so 55,000 is simply below the threshold and the ordinary
+    // reminder is the only notice.
+    const read = async (label: string, lastChancePoint: number): Promise<Session> => {
+      const { ctx, agent, session } = await engineHarness(sessionId(label), { ...BANDED, lastChanceRatio: lastChancePoint })
       ctx.llm.registerAdapter(['mock'], new ScriptedAdapter([
         usageResponseWith(BIG_ANSWER, 50000, 5000),
         usageResponseWith(BIG_ANSWER, 55000, 5000),
@@ -205,7 +208,7 @@ describe('last-chance band', () => {
     expect(lastChanceTexts(banded)).toHaveLength(1)
     expect(reminderTexts(banded)).toHaveLength(0)
 
-    const unbanded = await read('contrast-off', 0)
+    const unbanded = await read('contrast-off', BANDED.thresholdRatio)
     expect(lastChanceTexts(unbanded)).toHaveLength(0)
     // The ordinary reminder is unaffected by the switch and is not suppressed
     // by a band that does not exist.
@@ -243,33 +246,59 @@ describe('last-chance band', () => {
 })
 
 describe('last-chance configuration', () => {
-  it('defaults to a 10% band below the rollover threshold', () => {
+  it('defaults to three points in firing order', () => {
     const resolved = resolveConfig({})
-    expect(resolved.lastChanceRatio).toBe(0.1)
-    // The placement is the point: the rollover point itself is untouched.
-    expect(resolved.thresholdRatio).toBe(0.75)
-    expect(resolved.thresholdRatio - resolved.lastChanceRatio).toBeGreaterThan(0)
+    expect(resolved.thresholdRatio).toBe(0.79)
+    expect(resolved.lastChanceRatio).toBe(0.76)
+    expect(resolved.reminderThresholdRatio).toBe(0.72)
+    // The ordering is what the engine relies on: a notice delivered at or after
+    // the point where the next tier owns the step is suppressed for the whole
+    // window, so this inequality is the feature, not a style preference.
+    expect(resolved.reminderThresholdRatio).toBeLessThan(resolved.lastChanceRatio)
+    expect(resolved.lastChanceRatio).toBeLessThan(resolved.thresholdRatio)
   })
 
-  it('accepts zero as the documented way to switch the band off', () => {
-    expect(resolveConfig({ lastChanceRatio: 0 }).lastChanceRatio).toBe(0)
+  it('derives the stretch between the last two points instead of configuring it', () => {
+    // Same three points stated differently: moving the last-chance point moves
+    // the width with it, with no second value to keep in step.
+    const wide = resolveConfig({ thresholdRatio: 0.8, lastChanceRatio: 0.5, reminderThresholdRatio: 0.4 })
+    expect(wide.lastChanceRatio).toBe(0.5)
+    expect(wide.thresholdRatio - wide.lastChanceRatio).toBeCloseTo(0.3, 10)
   })
 
-  it('clamps a band wider than the rollover point instead of refusing the config', () => {
-    // A deployment with a very low threshold was valid before the band existed,
-    // so an inherited default must yield rather than fail the load. The card
-    // refuses the pair outright, so this path is only ever reached by defaults.
-    const narrow = { thresholdRatio: 0.4, reminderThresholdRatio: 0.2, lastChanceRatio: 0.5 }
-    expect(resolveConfig(narrow).lastChanceRatio).toBe(0.4)
-    // Zero stays zero: the switch-off value is never clamped up into a band.
-    // A tiny threshold is exactly the shape `tests/pressure-range.spec.ts`
-    // uses, and the inherited 10% default has to yield to it rather than fail.
-    const tiny = { thresholdRatio: 0.001, reminderThresholdRatio: 0.001 }
-    expect(resolveConfig({ ...tiny, lastChanceRatio: 0 }).lastChanceRatio).toBe(0)
-    expect(resolveConfig(tiny).lastChanceRatio).toBe(0.001)
+  it('accepts a collapsed point as the way to switch the tier off', () => {
+    // Equal points leave a zero-width stretch, which is the only sensible
+    // reading of "off" once the tier is a position rather than a width.
+    expect(resolveConfig({ thresholdRatio: 0.8, lastChanceRatio: 0.8 }).lastChanceRatio).toBe(0.8)
   })
 
-  it('refuses a band outside [0, 1]', () => {
+  it('keeps a stated ladder coherent instead of suppressing the reminder', () => {
+    // The engine reconciles rather than refuses: a scope hands it the whole
+    // effective configuration, so a user who lowers only `thresholdRatio` would
+    // otherwise trip over values they never chose. What matters is the outcome:
+    // each point still lands strictly before the one after it.
+    // Ordering is the invariant, not strict separation: a threshold with only
+    // one point of room collapses the ladder onto fewer tiers rather than
+    // failing, which is why the reminder may meet the last-chance point.
+    const over = resolveConfig({ thresholdRatio: 0.65, reminderThresholdRatio: 0.72 })
+    expect(over.lastChanceRatio).toBeLessThan(over.thresholdRatio)
+    expect(over.reminderThresholdRatio).toBeLessThanOrEqual(over.lastChanceRatio)
+  })
+
+  it('yields an inherited point to the room a low threshold leaves', () => {
+    // A row that configures no ladder keeps loading: the inherited points yield
+    // to the threshold they were given, so a harness threshold or a small-window
+    // deployment collapses the ladder instead of failing to boot.
+    const narrow = resolveConfig({ thresholdRatio: 0.5 })
+    expect(narrow.lastChanceRatio).toBeLessThan(narrow.thresholdRatio)
+    expect(narrow.reminderThresholdRatio).toBeLessThan(narrow.lastChanceRatio)
+    const tight = resolveConfig({ thresholdRatio: 0.4, reminderThresholdRatio: 0.2 })
+    expect(tight.reminderThresholdRatio).toBe(0.2)
+    expect(tight.lastChanceRatio).toBeLessThan(tight.thresholdRatio)
+  })
+
+  it('refuses a point outside (0, 1]', () => {
+    expect(() => resolveConfig({ lastChanceRatio: 0 })).toThrow(/lastChanceRatio/u)
     expect(() => resolveConfig({ lastChanceRatio: -0.1 })).toThrow(/lastChanceRatio/u)
     expect(() => resolveConfig({ lastChanceRatio: 1.5 })).toThrow(/lastChanceRatio/u)
     expect(() => resolveConfig({ lastChanceRatio: Number.NaN })).toThrow(/lastChanceRatio/u)

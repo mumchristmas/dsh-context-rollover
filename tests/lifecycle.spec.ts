@@ -89,7 +89,9 @@ describe('requested boundary honesty', () => {
       ...engine.controller.config,
       thresholdRatio: 0.001,
       reminderThresholdRatio: 0.001,
-      lastChanceRatio: 0,
+      // Collapsed onto the rollover point: the tier is off, as in every release
+      // before the ladder existed. The threshold here is 0.001.
+      lastChanceRatio: 0.001,
     }
     controller.pendingRollovers.set(session.id, { handoff: 'handoff '.repeat(2490) })
 
