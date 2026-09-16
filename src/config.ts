@@ -12,27 +12,50 @@ import z from '@deepseek-ai/schemastery'
 export interface RolloverConfig {
   /**
    * Automatic rollover pressure point as a fraction of the routed model's
-   * context window. Defaults to `0.75`, which is deliberately below the stock
+   * context window. Defaults to `0.79`, one point below the stock
    * `compaction-basic` default (`0.8`): the plugin intercepts compaction in
-   * every session, so it must reach the window first.
+   * every session, so it must reach the window first, and the ordering guard
+   * compares ratios (`otherRatio > thresholdRatio`), which leaves exactly this
+   * point of margin.
+   *
+   * The defaults on all three ratios assume the large-window models that now
+   * dominate deployment: a 1M context window turns this point into 790,000
+   * tokens and leaves 210,000 tokens of growth before the summarizer's
+   * threshold. On a small window the same fractions are far tighter, so treat
+   * them as a starting point and re-tune against `get_context_remaining`.
    */
   thresholdRatio?: number
   /**
    * One-time checkpoint reminder point as a fraction of the context window.
-   * Defaults to `0.6`.
+   * Defaults to `0.72`.
+   *
+   * This is the point at which a three-tier ladder still leaves the model a
+   * usable span to react *before* the last-chance band begins: with the
+   * defaults the band opens at 76% and the rollover fires at 79%.
+   *
+   * A reminder must land strictly before the band opens, because the engine
+   * suppresses an ordinary notice once the band owns the step rather than
+   * delivering the weaker message after the stronger one. Resolution enforces
+   * that ordering by lowering whichever of the two is derived; the settings card
+   * refuses a stated pair that would violate it, so a value written by hand
+   * cannot silently become an undeliverable notice.
    */
   reminderThresholdRatio?: number
   /**
-   * Width of the last-chance band, as a fraction of the context window. The
-   * band sits immediately **below** {@link thresholdRatio}, so it reserves room
-   * without moving the rollover: inside it the model is told, once per window,
-   * that this is the final stretch and how much prompt growth is left before
-   * the window is replaced. `0` disables the band, which is the behavior every
-   * release before this one had. Defaults to `0.1`.
+   * Where the last-chance stretch begins, as a fraction of the context window.
+   * The third and last tier of the ladder, after {@link reminderThresholdRatio}:
+   * past this point the model is told, once per window, that this is the final
+   * stretch and how much prompt growth is left before the window is replaced.
+   * Defaults to `0.76`.
    *
-   * Below the rollover point rather than above it on purpose: the automatic
-   * rollover has to keep firing before any other compaction backend's
-   * threshold, or a summarizer wins the session. A band that pushed the
+   * A *point*, like its two siblings, even though what it describes is a
+   * stretch: an operator reasons about when a tier fires, and the width between
+   * this point and {@link thresholdRatio} is arithmetic, not policy. Setting it
+   * equal to the rollover point is how the tier is switched off.
+   *
+   * It sits below the rollover point rather than above it on purpose: the
+   * automatic rollover has to keep firing before any other compaction backend's
+   * threshold, or a summarizer wins the session. A tier that pushed the
    * rollover later would silently do exactly that.
    */
   lastChanceRatio?: number
@@ -118,37 +141,75 @@ function validateRatio(name: string, value: number): void {
 }
 
 /**
+ * Clearance the default ladder keeps between the reminder and the last-chance
+ * band, as a fraction of the window. The reminder is delivered by an ordinary
+ * step, so it needs a step's worth of room in front of the band; a ladder
+ * configured to collapse onto the boundary would leave the notice unclaimed.
+ */
+const LADDER_CLEARANCE = 0.01
+
+/**
  * Validate and fill configuration defaults. Invalid values fail plugin load
  * (misconfiguration fails loud).
  * @param config - raw configuration from the plugin's cordis.yml row.
  * @returns the resolved configuration.
  */
 export function resolveConfig(config: RolloverConfig): ResolvedRolloverConfig {
-  const thresholdRatio = config.thresholdRatio ?? 0.75
-  const reminderThresholdRatio = config.reminderThresholdRatio ?? 0.6
-  const requestedLastChance = config.lastChanceRatio ?? 0.1
+  const thresholdRatio = config.thresholdRatio ?? 0.79
+  const lastChanceDefault = config.lastChanceRatio ?? 0.76
+  const reminderDefault = config.reminderThresholdRatio ?? 0.72
   const retainRatio = config.retainRatio ?? 0.1
   validateRatio('thresholdRatio', thresholdRatio)
-  validateRatio('reminderThresholdRatio', reminderThresholdRatio)
+  validateRatio('lastChanceRatio', lastChanceDefault)
+  validateRatio('reminderThresholdRatio', reminderDefault)
   validateRatio('retainRatio', retainRatio)
-  // The band is a width, not a point: zero is the documented way to switch the
-  // last-chance protocol off, so it carries its own check rather than the
-  // strictly-positive one the other ratios use.
-  if (!Number.isFinite(requestedLastChance) || requestedLastChance < 0 || requestedLastChance > 1) {
-    throw new TypeError(`context-rollover: lastChanceRatio must be in [0, 1], got ${String(requestedLastChance)}`)
-  }
-  if (reminderThresholdRatio > thresholdRatio) {
-    throw new TypeError(
-      `context-rollover: reminderThresholdRatio (${reminderThresholdRatio}) must not exceed `
-      + `thresholdRatio (${thresholdRatio})`,
-    )
-  }
-  // The band reserves room *before* the rollover, so it cannot be wider than
-  // the point it sits under. That is clamped rather than refused: an existing
-  // deployment with a very low `thresholdRatio` was valid before the band
-  // existed, and a new default must not turn it into a load failure. The card
-  // refuses the pair outright, so a human never writes it on purpose.
-  const lastChanceRatio = Math.min(requestedLastChance, thresholdRatio)
+  // ── the ladder ────────────────────────────────────────────────────────────
+  //
+  // Three points on one line, in the order they fire:
+  //
+  //     reminder  <  last chance  <  rollover
+  //
+  // Every one of them is a *point*, so a later tier can never be configured to
+  // open after the tier it precedes, and the width of the middle stretch is
+  // arithmetic rather than policy. That ordering is not cosmetic: the engine
+  // suppresses an ordinary notice once the last-chance tier owns the step,
+  // because a weaker message delivered after a stronger one is noise.
+  //
+  // Each point yields to the room the tier after it leaves, which is what makes
+  // a single-field edit supportable: a settings scope hands this function the
+  // *whole* effective configuration, so a user who lowers `thresholdRatio`
+  // alone would otherwise be tripping over ladder values they never chose. The
+  // card refuses a *typed* value that is out of order, which is the mistake a
+  // human can still be told how to fix.
+  // A derived point keeps clearance from the point after it, so a notice is
+  // delivered strictly *before* the next tier opens rather than on its boundary:
+  // at the boundary that tier's own guard already owns the step, and a value
+  // clamped onto it would be the silent no-op this ladder exists to avoid. The
+  // floor is a share of the ceiling rather than a constant, so a harness-sized
+  // threshold of a tenth of a percent still resolves to a positive point and a
+  // derived default is never the reason a row fails to load.
+  const clampDerived = (value: number, ceiling: number): number =>
+    Math.max(Math.min(value, ceiling - LADDER_CLEARANCE), ceiling * 0.1)
+  // A *stated* point is honored instead, bounded only by the tier after it. That
+  // split keeps two opposite uses working at once: an operator may collapse the
+  // last-chance point onto the rollover to switch that tier off, while a
+  // deployment that lowers only `thresholdRatio` still loads rather than
+  // tripping over ladder values it never chose.
+  //
+  // Both derived points run through the same clamp, and each is bounded by the
+  // *resolved* point after it rather than by its stated value: a threshold that
+  // pushed the last-chance point down has to carry the reminder down with it,
+  // or a collapsed pair would leave tier 1 with no room at all.
+  const resolvePoint = (stated: number | undefined, fallback: number, ceiling: number): number =>
+    stated === undefined
+      ? clampDerived(fallback, ceiling)
+      : Math.min(stated, ceiling)
+  const lastChanceRatio = resolvePoint(config.lastChanceRatio, lastChanceDefault, thresholdRatio)
+  const reminderThresholdRatio = resolvePoint(
+    config.reminderThresholdRatio,
+    reminderDefault,
+    lastChanceRatio,
+  )
   const retainTokens = config.retainTokens ?? null
   if (retainTokens !== null && (!Number.isSafeInteger(retainTokens) || retainTokens < 0)) {
     throw new TypeError(`context-rollover: retainTokens must be a non-negative integer, got ${String(retainTokens)}`)

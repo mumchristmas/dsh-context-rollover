@@ -72,30 +72,41 @@ const DICTS = {
     'card.title': 'Context Rollover',
     'card.expand': 'Expand',
     'card.collapse': 'Collapse',
-    'card.intro': 'Automatic rollover happens at the threshold below. It must stay strictly under the threshold of '
-      + "the session's own compaction backend, or that backend summarises first.",
-    'card.thresholdRatio': 'Rollover threshold (%)',
-    'card.thresholdRatio.hint': 'At this share of the window the session rolls over: a new window, a checkpoint, and '
-      + 'the recent tail, with no summary. Keep it strictly below the compaction backend\'s threshold, or that backend '
-      + 'summarises first.',
-    'card.reminderThresholdRatio': 'Reminder threshold (%)',
-    'card.reminderThresholdRatio.hint': 'At this share the model is reminded, once per window, that the window is '
-      + 'filling up. How the span between this point and the rollover threshold is used is the model\'s own call: '
-      + 'notes, a handoff through new_context, or simply carrying on.',
+    'card.intro': 'Three points on one scale, in the order they fire: 1 notify, 2 warn, 3 execute. Each is a '
+      + 'share of the window, and the whole ladder has to stay below the session\'s own compaction backend.',
+    'card.thresholdRatio': '3. Execute — roll over at (%)',
+    'card.thresholdRatio.hint': 'The execute point. At this share of the window the plugin rolls over: a new '
+      + "window, a checkpoint, and the recent tail, with no summary. Keep it strictly below the compaction "
+      + 'backend\'s threshold, or that backend summarises first.',
+    'card.reminderThresholdRatio': '1. Notify (%)',
+    'card.reminderThresholdRatio.hint': 'The notify point, and the first tier to fire. The model is reminded once '
+      + 'per window that the window is filling up. It has to land before the warn point, so that "filling up" '
+      + 'arrives before "this is the end"; the harness lowers it automatically when a lower execute point leaves '
+      + 'no room.',
     'card.retainTokens': 'Retained tail (tokens)',
-    'card.retainTokens.hint': 'Recent conversation kept verbatim across a rollover, counted in tokens. Empty keeps '
-      + "the deployment's default, which is a share of the window.",
+    'card.retainTokens.hint': 'Recent conversation kept verbatim across a rollover, counted in tokens. Empty '
+      + "keeps the deployment's default, a share of the window. Worth setting explicitly on a large window: a "
+      + 'share of 1M is a very large tail to carry into every fresh window.',
     'card.retainTokens.unset': 'share of window',
-    'card.lastChanceRatio': 'Last chance from (%)',
-    'card.lastChanceRatio.hint': 'The final stretch before the rollover, measured as a share of the window. On '
-      + 'entering it the model is told once that this is its last chance and how much growth is left, so it stops '
-      + 'and writes notes instead of being cut off mid-task. The rollover still fires at the threshold above. '
-      + '0 switches the notice off, which is how every release before this one behaved.',
+    'card.lastChanceRatio': '2. Warn (%)',
+    'card.lastChanceRatio.hint': 'Where the final stretch opens. Past this share of the window the model is told '
+      + 'once that this is its last chance and how much growth is left, so it stops and writes notes instead of '
+      + 'being cut off mid-task. The stretch runs from here up to tier 3, and its width is that difference (see '
+      + 'the line below). Setting this equal to tier 3 switches the tier off.',
+    'card.ladder': 'Where the tiers land',
+    'card.ladder.reminder': '1 notify',
+    'card.ladder.band': '2 warn',
+    'card.ladder.threshold': '3 execute',
+    'card.ladder.bandValue': 'opens at {start}% (then {width}% wide)',
+    'card.ladder.note': 'Shares of the window, not token counts: the token distances scale with it, and on a '
+      + 'much smaller window they are far tighter. Re-tune against those distances, not the ratios.',
+    'card.ladder.degenerate': 'No room left between tiers: the notify point cannot land before the warn point. '
+      + 'Raise the execute point or lower the warn point.',
     'card.pinActiveRequest': 'Keep the active request',
     'card.pinActiveRequest.hint': 'On, a rollover never drops the human message that started the open turn, even '
       + 'when a long turn has pushed it past the retained-tail budget. It costs rollover room in exchange.',
-    'card.invalid.lastChance': 'The last chance cannot start before the window does: its width {lastChance}% must '
-      + 'not exceed the rollover threshold {threshold}%.',
+    'card.invalid.lastChance': 'The last chance cannot open at or after the window is replaced: its point '
+      + '{lastChance}% must stay below the execute point {threshold}%.',
     'card.handoffMaxChars': 'Handoff limit (characters)',
     'card.handoffMaxChars.hint': 'Largest handoff a model may attach to new_context. Counted in characters, not '
       + 'tokens.',
@@ -115,8 +126,8 @@ const DICTS = {
     'card.unset': 'unset',
     'card.advanced': 'Advanced',
     'card.advanced.hint': 'Guardrails and tool toggles; the defaults suit most sessions.',
-    'card.invalid.reminder': 'The reminder threshold must stay below the rollover threshold: {reminder} is not below '
-      + '{threshold}.',
+    'card.invalid.reminderOrder': 'The reminder has to fire before the last chance opens: {reminder} is not below '
+      + 'the last-chance point {start}. Lower the reminder, lower the last chance, or raise the execute point.',
     'card.overridden': 'set here',
     'card.writeFailed': 'The change was not saved.',
     'card.system': 'Compaction backend',
@@ -140,24 +151,37 @@ const DICTS = {
     'card.title': 'Context Rollover',
     'card.expand': '展开',
     'card.collapse': '收起',
-    'card.intro': '到下面的阈值就自动换窗口。它必须严格小于本会话压缩后端的阈值，否则后端会先做摘要。',
-    'card.thresholdRatio': '滚动归档阈值（%）',
-    'card.thresholdRatio.hint': '窗口用到该比例时自动换窗：开新窗口、写检查点、保留最近原文，不做摘要。'
-      + '该值须严格低于本会话压缩后端的阈值（实测值见下方「压缩后端」）。',
-    'card.reminderThresholdRatio': '提醒阈值（%）',
-    'card.reminderThresholdRatio.hint': '窗口用到该比例时向模型提醒一次（每个窗口一次）：提示它窗口接近上限。'
-      + '从该比例到滚动归档阈值之间的区间由模型自行判断如何使用，例如写笔记、用 new_context 交接，或继续当前工作。',
+    'card.intro': '同一条刻度上的三个点，按触发顺序：1 提示 → 2 预警 → 3 执行。'
+      + '每个都是窗口占比，整条阶梯须低于本会话自己的压缩后端。',
+    'card.thresholdRatio': '3. 执行 —— 到此处换窗（%）',
+    'card.thresholdRatio.hint': '执行点。窗口用到该比例时自动换窗：开新窗口、写检查点、保留最近原文，不做摘要。'
+      + '该值须严格低于本会话压缩后端的阈值，否则后端会先做摘要。',
+    'card.reminderThresholdRatio': '1. 提示（%）',
+    'card.reminderThresholdRatio.hint': '提示点，三档中最早触发的一档。窗口用到该比例时向模型提醒一次（每个窗口一次）：'
+      + '窗口正在变满。它必须落在预警点之前，这样「正在变满」才会先于「这是最后一段」到达；'
+      + '当执行点被调低、前面没余量时，本插件会自动把它往下压来维持这个顺序。',
     'card.retainTokens': '保留最近对话（Token）',
-    'card.retainTokens.hint': '换窗后原样保留的最近对话，按 Token 计。留空表示沿用部署默认值（窗口的 10%）。',
+    'card.retainTokens.hint': '换窗后原样保留的最近对话，按 Token 计。留空表示沿用部署默认值（窗口的 10%）。'
+      + '大窗口上建议显式设置：1M 的 10% 是十万级 Token，会被每一个新窗口一直背着。',
     'card.retainTokens.unset': '按窗口比例',
-    'card.lastChanceRatio': '最后机会起始（%）',
-    'card.lastChanceRatio.hint': '换窗之前的最后一段，按窗口比例计。进入这一段时模型会收到一次提醒：这是最后机会、还能增长多少，'
-      + '于是它可以停下来写笔记，而不是在干活的中途被切断。换窗仍然发生在上面的阈值处。填 0 表示不发这条提醒，'
-      + '也就是此前所有版本的行为。',
+    'card.lastChanceRatio': '2. 预警（%）',
+    'card.lastChanceRatio.hint': '最后一段的起点。窗口用到这里之后，模型会收到一次提醒：这是最后机会、还能增长多少，'
+      + '于是它可以停下来写笔记，而不是在干活的中途被切断。这一段从这里一直延伸到第 3 档，宽度就是两者之差（见下方那行）。'
+      + '把它填成与第 3 档相同，即关闭这一档。',
+    'card.ladder': '三档落在哪里',
+    'card.ladder.reminder': '1 提示',
+    'card.ladder.band': '2 预警',
+    'card.ladder.threshold': '3 执行',
+    'card.ladder.bandValue': '起于 {start}%（其后宽 {width}%）',
+    'card.ladder.note': '这些是窗口占比，不是 Token 数：对应距离随窗口放大，窗口小得多时会紧很多。'
+      + '请按绝对距离重新调参，而不是按比例。',
+    'card.ladder.degenerate': '三档之间已经挤不出间距：提示点无法落在预警点之前。请调高执行点，或调低预警点。',
     'card.pinActiveRequest': '保底保留当前请求',
     'card.pinActiveRequest.hint': '开启后，换窗永远不会丢掉开启当前回合的那条人类消息，即使长回合已经把它挤出'
       + '保留区。代价是单次换窗腾出的空间更少。',
-    'card.invalid.lastChance': '最后机会不能从窗口开始处就生效：它的宽度 {lastChance}% 不能超过滚动归档阈值 {threshold}%。',
+    'card.invalid.lastChance': '最后机会不能落在换窗之后：它的点 {lastChance}% 必须低于执行点 {threshold}%。',
+    'card.invalid.reminderOrder': '提醒必须早于最后机会触发：{reminder}% 不低于最后机会点 {start}%。'
+      + '请调低提醒、调低最后机会点，或调高执行点。',
     'card.handoffMaxChars': '交接文本上限（字符数）',
     'card.handoffMaxChars.hint': '模型调用 new_context 时允许附带的交接文本上限，按字符数计（不是 Token）。',
     'card.preempt': '拦截压缩',
@@ -174,7 +198,6 @@ const DICTS = {
     'card.unset': '未设置',
     'card.advanced': '高级',
     'card.advanced.hint': '护栏与工具开关；默认值适合多数会话。',
-    'card.invalid.reminder': '提醒阈值必须低于滚动归档阈值：{reminder} 不低于 {threshold}。',
     'card.overridden': '已自定义',
     'card.writeFailed': '改动没有保存成功。',
     'card.system': '压缩后端',
@@ -386,6 +409,30 @@ const CSS = `
 }
 .dsh-context-rollover-card input[type='checkbox'] { width: 16px; height: 16px; accent-color: var(--dsw-alias-brand-primary); }
 .dsh-context-rollover-card .dsh-hint { font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-tertiary); }
+/* The ladder reads top to bottom in the order it fires, so it gets one column
+   and a rail rather than the two-column auto-flow the other fields use. */
+.dsh-context-rollover-card .dsh-ladder { display: flex; flex-direction: column; padding: 4px 0 0; }
+.dsh-context-rollover-card .dsh-ladder .dsh-field {
+  border-left: 2px solid var(--dsw-alias-border-l2); padding-left: 12px;
+}
+.dsh-context-rollover-card .dsh-ladder .dsh-field + .dsh-field { border-top: 0; }
+.dsh-context-rollover-card .dsh-step {
+  flex: none; display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  color: var(--dsw-alias-label-tertiary); font-variant-numeric: tabular-nums;
+}
+.dsh-context-rollover-card .dsh-ladder-foot {
+  display: flex; flex-direction: column; gap: 4px; padding: 10px 0 12px; min-width: 0;
+  border-top: 0.5px solid var(--dsw-alias-border-l2);
+}
+.dsh-context-rollover-card .dsh-ladder-group { min-width: 0; }
+.dsh-context-rollover-card .dsh-ladder-track > span,
+.dsh-context-rollover-card .dsh-ladder-foot > .dsh-hint { overflow-wrap: anywhere; }
+.dsh-context-rollover-card .dsh-ladder-track { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.dsh-context-rollover-card .dsh-ladder-track > span {
+  font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+}
 .dsh-context-rollover-card .dsh-system {
   display: flex; flex-direction: column; gap: 4px; padding: 12px 0;
   border-top: 0.5px solid var(--dsw-alias-border-l2);
@@ -577,18 +624,29 @@ function RolloverModeButton(props) {
 
 
 /**
- * The settings a session's owner actually tunes: where the window rolls over,
- * when they are warned, how much recent conversation survives it, and whether
- * the plugin takes over compaction at all. Everything else is a guardrail or a
- * tool mount, and lives under {@link ADVANCED_FIELDS}.
+ * The ladder: the three points that fire, in the order they fire. They are
+ * edited as one group and rendered in one column, because the relationship
+ * between them (reminder, then the last-chance band, then the rollover) *is*
+ * the setting. A two-column flow paired the band width with a retention budget
+ * on the same row, which read as three unrelated numbers.
  */
-const CARD_FIELDS = [
-  { key: 'thresholdRatio', kind: 'percent', step: 1 },
-  { key: 'lastChanceRatio', kind: 'percent', step: 1 },
-  { key: 'reminderThresholdRatio', kind: 'percent', step: 1 },
+const LADDER_FIELDS = [
+  { key: 'reminderThresholdRatio', kind: 'percent', step: 1, labelKey: 'card.reminderThresholdRatio' },
+  { key: 'lastChanceRatio', kind: 'percent', step: 1, labelKey: 'card.lastChanceRatio' },
+  { key: 'thresholdRatio', kind: 'percent', step: 1, labelKey: 'card.thresholdRatio' },
+]
+
+/**
+ * The rest of the surface: everything a session's owner tunes that is not part
+ * of the ladder. Guardrails and tool mounts live under {@link ADVANCED_FIELDS}.
+ */
+const SURFACE_FIELDS = [
   { key: 'retainTokens', kind: 'number', min: 0, placeholderKey: 'card.retainTokens.unset' },
   { key: 'preempt', kind: 'boolean' },
 ]
+
+/** Every field the card owns, for override counting and "reset all". */
+const CARD_FIELDS = [...LADDER_FIELDS, ...SURFACE_FIELDS]
 
 /**
  * Guardrails and policy knobs a session's owner rarely touches. The retention
@@ -735,7 +793,7 @@ function refusalDetail(error) {
 function fieldRow(t, snapshot, scope, field, guardError, write) {
   const { key, kind } = field
   const tipId = `dsh-tip-${key}`
-  const label = t(`card.${key}`)
+  const label = t(field.labelKey ?? `card.${key}`)
   const hint = t(`card.${key}.hint`)
   const value = fieldValue(snapshot, key)
   const overridden = fieldOverridden(snapshot, key)
@@ -897,12 +955,67 @@ function systemPanel(t, report, currentThreshold, preempt) {
 }
 
 /**
+ * The ladder panel: the three ordered controls, plus a read-only line that
+ * states the order they fire in.
+ *
+ * The three controls are points, so the summary is mostly a restatement of what
+ * is already on screen. What it adds is the *width* of the last stretch, which
+ * is derived from two of the boxes and belongs to neither of them, and one line
+ * saying that shares scale with the window while the distances do not read the
+ * same way on a small one.
+ * @param t - the card's translator.
+ * @param snapshot - current settings snapshot.
+ * @param scope - the bound settings scope.
+ * @param guardError - local coherence check shared with every field.
+ * @param write - the card's write controller.
+ * @returns the panel element.
+ */
+function ladderPanel(t, snapshot, scope, guardError, write) {
+  const threshold = fieldValue(snapshot, 'thresholdRatio')
+  const band = fieldValue(snapshot, 'lastChanceRatio')
+  const reminder = fieldValue(snapshot, 'reminderThresholdRatio')
+  const numbers = [threshold, band, reminder].every(value => typeof value === 'number')
+  // Tier 2 is a point, so the only question is whether tier 1 lands before it.
+  // A collapsed tier 2 (its point raised to the execute point) is a two-tier
+  // ladder by choice rather than a broken one, and needs no complaint.
+  const degenerate = numbers && reminder >= band
+  const rows = numbers
+    ? [
+        t('card.ladder.reminder') + ' ' + asPercent(reminder),
+        t('card.ladder.band') + ' ' + t('card.ladder.bandValue', {
+          // Tier 2 is a point, so it *is* where the stretch opens; the width is
+          // the derived difference up to tier 3.
+          start: Math.round(band * 100),
+          width: Math.round((threshold - band) * 100),
+        }),
+        t('card.ladder.threshold') + ' ' + asPercent(threshold),
+      ]
+    : [t('card.ladder.note')]
+  const body = [
+    createElement('div', { className: 'dsh-ladder' },
+      ...LADDER_FIELDS.map(field => fieldRow(t, snapshot, scope, field, guardError, write))),
+    createElement('div', { className: 'dsh-ladder-foot', key: 'ladder-foot' },
+      createElement('strong', null, t('card.ladder')),
+      createElement('div', { className: 'dsh-ladder-track' },
+        ...rows.map((row, index) => createElement('span', { key: `row-${String(index)}` }, row))),
+      createElement('span', { className: 'dsh-hint' },
+        t('card.ladder.note', numbers ? { collapsed: degenerate ? 'yes' : 'no' } : {})),
+    ),
+  ]
+  if (degenerate) {
+    body.push(createElement('p', { className: 'dsh-warn', key: 'ladder-degenerate' },
+      t('card.ladder.degenerate')))
+  }
+  return createElement('div', { className: 'dsh-ladder-group' }, ...body)
+}
+
+/**
  * The Plugin configuration card for this namespace.
  *
  * Laid out like the section's own cards — a header that discloses the body —
- * with the four policy settings on the surface and the guardrails behind an
- * Advanced disclosure. Writes settle per field rather than through a staged
- * save, because every value here is a live threshold.
+ * with the ladder and the remaining policy settings on the surface and the
+ * guardrails behind an Advanced disclosure. Writes settle per field rather than
+ * through a staged save, because every value here is a live threshold.
  * @param props - settings-scope binding plus the shell's locale seat.
  * @returns the card element tree.
  */
@@ -928,30 +1041,47 @@ function RolloverSettingsCard(props) {
     const threshold = key === 'thresholdRatio' ? next : currentThreshold
     const reminder = key === 'reminderThresholdRatio' ? next : currentReminder
     const lastChance = key === 'lastChanceRatio' ? next : currentLastChance
-    // The band is checked first: it is the pair the engine itself refuses, and
-    // a card that reported the weaker complaint would send the user to fix the
-    // wrong box.
-    if (typeof threshold === 'number' && typeof lastChance === 'number' && lastChance > threshold) {
-      // Both fields are percent controls, so the refusal has to be stated in
-      // the units the boxes show. "0.6 is not below 0.55" printed beside inputs
-      // reading 60 and 55 reads like a different pair of numbers.
-      const message = t('card.invalid.lastChance', {
-        threshold: Math.round(threshold * 100),
-        lastChance: Math.round(lastChance * 100),
-      })
+    /**
+     * Refuse only a value that is itself out of order. An edit that a *later*
+     * tier merely has to yield to is not the typed value's fault: the engine
+     * re-derives the tiers after it, so refusing those would block lowering the
+     * execute point, which is the edit a user is most likely to make. Stated
+     * refusals therefore use the ordering the three points must satisfy:
+     *
+     *     reminder  <  last chance  <  execute
+     */
+    const refuse = (messageKey, values) => {
+      const message = t(messageKey, values)
       setRefusal(message)
       return message
     }
-    if (typeof threshold !== 'number' || typeof reminder !== 'number' || reminder <= threshold) {
-      setRefusal(undefined)
-      return undefined
+    // In the units the boxes show: "0.6 is not below 0.55" printed beside
+    // inputs reading 60 and 55 reads like a different pair of numbers.
+    if (key === 'lastChanceRatio' && typeof threshold === 'number' && lastChance >= threshold) {
+      return refuse('card.invalid.lastChance', {
+        threshold: Math.round(threshold * 100),
+        lastChance: Math.round(lastChance * 100),
+      })
     }
-    const message = t('card.invalid.reminder', {
-      reminder: Math.round(reminder * 100),
-      threshold: Math.round(threshold * 100),
-    })
-    setRefusal(message)
-    return message
+    // A reminder at or after the last-chance point is dropped by the engine for
+    // the rest of the window, so accepting it would save a notice that never
+    // arrives. Scoped to the reminder being the edited field on purpose: the
+    // same pair of numbers is *not* a refusal when the user is moving the warn
+    // point down onto the notify point, because the engine re-derives a
+    // round of that.
+    if (key === 'reminderThresholdRatio' && typeof lastChance === 'number' && reminder >= lastChance) {
+      return refuse('card.invalid.reminderOrder', {
+        reminder: Math.round(reminder * 100),
+        start: Math.round(lastChance * 100),
+      })
+    }
+    // Nothing else is refused. An edit that leaves the *other* two points out of
+    // order is legal: the engine re-derives them into place, and blocking it
+    // would reject lowering the execute point or the warn point, which are the
+    // edits a user is most likely to make. The two checks above are exactly the
+    // engine's own ordering rule, applied to the value being typed.
+    setRefusal(undefined)
+    return undefined
   }
   const title = t('card.title')
   /**
@@ -1069,7 +1199,8 @@ function RolloverSettingsCard(props) {
                 }, t('card.resetAll')),
               )
             : null,
-          createElement('div', { className: 'dsh-grid' }, ...renderFields(CARD_FIELDS)),
+          ladderPanel(t, snapshot, scope, guardError, write),
+          createElement('div', { className: 'dsh-grid' }, ...renderFields(SURFACE_FIELDS)),
           systemPanel(t, report, currentThreshold, preemptOf(snapshot)),
           refusal === undefined ? null : createElement('p', { className: 'dsh-warn' }, refusal),
           createElement('button', {

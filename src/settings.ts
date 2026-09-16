@@ -65,9 +65,13 @@ const ENGINE_DEFAULTS = resolveConfig({})
 
 /** Schemastery validation for {@link RolloverSettings}. */
 export const RolloverSettingsSchema: z<RolloverSettings> = z.object({
-  thresholdRatio: z.number().default(ENGINE_DEFAULTS.thresholdRatio),
-  reminderThresholdRatio: z.number().default(ENGINE_DEFAULTS.reminderThresholdRatio),
-  lastChanceRatio: z.number().default(ENGINE_DEFAULTS.lastChanceRatio),
+  // Deliberately schemaless of defaults: a schema default would make an absent
+  // ladder point indistinguishable from a stated one, and the engine resolves
+  // the two differently (a derived point keeps clearance from the tier after it,
+  // a stated one is honored). Absent means "let the engine derive it".
+  thresholdRatio: z.number(),
+  reminderThresholdRatio: z.number(),
+  lastChanceRatio: z.number(),
   pinActiveRequest: z.boolean().default(ENGINE_DEFAULTS.pinActiveRequest),
   retainRatio: z.number().default(ENGINE_DEFAULTS.retainRatio),
   retainTokens: z.number().step(1).min(0),
@@ -84,6 +88,12 @@ export const RolloverSettingsSchema: z<RolloverSettings> = z.object({
  * A card renders this layer, so it must be the *effective* configuration — an
  * empty base would show empty inputs for every value the user has not touched,
  * which reads as "no value" rather than "the default".
+ *
+ * The two derived members of the ladder are resolved here exactly as the engine
+ * resolves them, including the clamp that keeps a reminder in front of the band
+ * when a low `thresholdRatio` leaves no room. That clamp is what makes lowering
+ * the rollover point a supported single-field edit rather than a write the
+ * engine then refuses.
  * @param rowConfig - the plugin row's configuration.
  * @returns every field a card can edit, with nothing absent but deliberate.
  */

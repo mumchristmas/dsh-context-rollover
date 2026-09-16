@@ -119,16 +119,17 @@ Two host-side changes are worth knowing before you upgrade. Neither needs a plug
 
 ## Use
 
-- **It works on its own.** At 75% of the window it rolls over using the notes and the
-  last messages; from 60% it reminds the model once per window to save notes and cross at
-  a clean point, and from 65% it says so in as many words: *this is the final stretch,
-  here is how much room is left, stop and write the notes*. A provider-confirmed context
-  overflow forces the same rollover and retries the request.
-- **The last chance is a real one.** The final-stretch notice arrives with 10% of the
-  window still ahead of it, so the model has room to answer it — which a window that is
-  merely *reported* on never gives. The notice does not move the rollover: it still fires
-  at 75%, before any other compaction backend's threshold, or a summarizer would win the
-  session instead.
+- **It works on its own.** Three points on one scale, in the order they fire: from 72% of
+  the window it reminds the model once per window to save notes and cross at a clean point;
+  from 76% it says so in as many words: *this is the final stretch, here is how much room is
+  left, stop and write the notes*; at 79% it rolls over using the notes and the last
+  messages. A provider-confirmed context overflow forces the same rollover and retries the
+  request.
+- **The last chance is a real one.** The final-stretch notice arrives with 3% of the window
+  still ahead of it, so the model has room to answer it, which a window that is merely
+  *reported* on never gives. The notice does not move the rollover: it still fires at 79%,
+  before any other compaction backend's threshold, or a summarizer would win the session
+  instead.
 - **The request you are waiting on is never dropped.** A long autonomous turn can push the
   message that started it past the retained tail; the rollover keeps that message and the
   work after it anyway, at the cost of a smaller rollover.
@@ -151,9 +152,42 @@ outright, and this is a per-session directory on one machine, not a sandbox.
 
 The rollover and reminder thresholds, the last-chance band, the active-request pin, and the
 retained tail live in the **Plugin configuration → Context rollover** settings card
-(`thresholdRatio: 0.75`, `reminderThresholdRatio: 0.6` and `lastChanceRatio: 0.1` by
+(`thresholdRatio: 0.79`, `lastChanceRatio: 0.76` and `reminderThresholdRatio: 0.72` by
 default; the tail is edited in tokens, and empty means the deployment's share of the
-window, `retainRatio: 0.1`). Every knob also has a row in the plugin's `cordis.yml`.
+window, `retainRatio: 0.1`). Every knob also has a row in the plugin's `cordis.yml`. All
+three are *points*, so the card prints them as one numbered scale, with the width of the
+last stretch (79 − 76) shown as the arithmetic it is.
+
+### These defaults assume a large window
+
+The shipped ladder is tuned for the million-token context windows that now dominate
+Chinese-model deployments. Everything in it is a *share* of the window, so the token
+distances scale with it:
+
+| window | tier 3 executes at 79% | tier 1 fires 70,000 tokens earlier | tier 2 opens 30,000 before that |
+|---|---:|---:|---:|
+| 1M | 790,000 | 720,000 | 760,000 |
+| 272K | 214,880 | 195,840 | 206,720 |
+| 128K | 101,120 | 92,160 | 97,280 |
+
+On a 1M window those are comfortable distances. They are the reason the default band is 3%
+rather than the 10% an earlier release shipped: 10% of a million tokens would spend 100,000
+tokens of every window on the final stretch alone.
+
+**On a much smaller window the same shares are far tighter**, and below roughly 180K the
+absolute distances start to matter more than the ratios: 8,960 tokens of reminder-to-rollover
+room at 128K is roughly one large tool result, so a single step can carry the window from
+the reminder into the band and past it, and the warning never gets a usable step. If you run a small-window model, treat the
+defaults as a starting point rather than a policy and explore your own boundaries —
+`get_context_remaining` reports the live numbers, and the card's ladder line shows where
+each tier currently lands. Raising `reminderThresholdRatio` widens the warning lead;
+lowering `lastChanceRatio` gives the model more room before the last stretch; and the
+retained tail is worth setting explicitly in tokens rather than as a share.
+
+Keep `reminderThresholdRatio + lastChanceRatio` at or below `thresholdRatio`, and the
+rollover threshold strictly below the session's compaction backend (the card reports the
+strictest threshold it has observed). A ladder that violates the first is suppressed rather
+than delivered — the card refuses such a pair before writing it.
 
 ## Read the source, then file issues
 

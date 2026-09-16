@@ -630,16 +630,16 @@ export class RolloverController {
     const promptTokens = measuredPromptTokens(this.ctx.tokenMeter.measure(session))
     if (promptTokens === null) return undefined
     const thresholdTokens = Math.floor(contextWindow * this.config.thresholdRatio)
-    const graceTokens = Math.floor(contextWindow * this.config.lastChanceRatio)
+    // Each tier is a configured *point*; the room between this one and the
+    // rollover is derived here rather than configured, because an operator
+    // reasons about when a tier fires and the width is arithmetic.
+    const graceStartTokens = Math.floor(contextWindow * this.config.lastChanceRatio)
     return {
       promptTokens,
       contextWindow,
       thresholdTokens,
-      graceTokens,
-      // The band sits immediately below the rollover, so the room it reserves
-      // is the stretch the model may still use — and the rollover keeps firing
-      // exactly where it always did.
-      graceStartTokens: Math.max(0, thresholdTokens - graceTokens),
+      graceTokens: Math.max(0, thresholdTokens - graceStartTokens),
+      graceStartTokens,
     }
   }
 
@@ -1204,19 +1204,20 @@ export class RolloverController {
       ? this.t('status.self')
       : `${other.name ?? 'compaction'}${backendRatio === undefined ? '' : ` @ ${backendRatio}`}`
     const intercepting = this.shouldPreemptAutomatic(invocation.agent)
-    // The band is reported by where it opens, because that is the moment the
-    // model is told to stop and the number a human is deciding about. "off" is
-    // a different answer from "0% of the window" and has to read as one.
-    const band = this.config.lastChanceRatio <= 0
+    // Every tier is reported by the point it opens at, which is the moment the
+    // model is told to stop and the number a human is deciding about. The
+    // last-chance tier reads "off" when it has been collapsed onto the rollover
+    // point, because that is a different answer from "opens at 79%".
+    const lastChance = this.config.lastChanceRatio >= this.config.thresholdRatio
       ? this.t('status.off')
-      : `${Math.round((this.config.thresholdRatio - this.config.lastChanceRatio) * 100)}%`
+      : `${Math.round(this.config.lastChanceRatio * 100)}%`
     return {
       kind: 'success',
       text: [
         `${this.t('status.mode')}: ${this.t(`mode.name.${mode}`)}`,
         `${this.t('status.rolloverAt')}: ${Math.round(this.config.thresholdRatio * 100)}%`,
         `${this.t('status.reminderAt')}: ${Math.round(this.config.reminderThresholdRatio * 100)}%`,
-        `${this.t('status.lastChanceAt')}: ${band}`,
+        `${this.t('status.lastChanceAt')}: ${lastChance}`,
         `${this.t('status.backend')}: ${backend}`,
         `${this.t('status.intercepting')}: ${this.t(intercepting ? 'status.yes' : 'status.no')}`,
       ].join('\n'),
