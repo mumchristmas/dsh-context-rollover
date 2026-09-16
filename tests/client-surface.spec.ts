@@ -212,9 +212,9 @@ function loadClient(): {
         presets: ['standard'],
         stockThresholdRatio: 0.8,
         self: {
-          thresholdRatio: 0.75,
-          reminderThresholdRatio: 0.6,
-          lastChanceRatio: 0.1,
+          thresholdRatio: 0.79,
+          reminderThresholdRatio: 0.72,
+          lastChanceRatio: 0.76,
           preempt: true,
         },
         safeBelow: 0.8,
@@ -268,9 +268,9 @@ function fakeScope(): FakeScope {
   const refuse: { value: boolean } = { value: false }
   const reject: { value: boolean } = { value: false }
   const base: Record<string, unknown> = {
-    thresholdRatio: 0.75,
-    reminderThresholdRatio: 0.6,
-    lastChanceRatio: 0.1,
+    thresholdRatio: 0.79,
+    reminderThresholdRatio: 0.72,
+    lastChanceRatio: 0.76,
     retainRatio: 0.1,
     preempt: true,
   }
@@ -430,8 +430,12 @@ describe('settings card', () => {
     expect(card.options.key).toBe('context-rollover')
     expect(loaded.boundNamespaces).toContain('context-rollover')
 
-    // A shell reader that answers from this plugin's namespace.
-    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    // A shell reader that answers from this plugin's namespace. Values are
+    // echoed into the answer so a placeholder's arguments are assertable.
+    const props = {
+      t: (key: string, values?: unknown) => `T:${key}${values === undefined ? '' : JSON.stringify(values)}`,
+      scope: loaded.scope,
+    }
     // Collapsed by default, exactly like the section's own plugin cards: the
     // header names the plugin, the body holds the controls.
     const collapsed = loaded.render(card.component, props)
@@ -450,20 +454,30 @@ describe('settings card', () => {
     expect(inputs).toHaveLength(5)
     const labels = inputs.map(input => input.props['aria-label'])
     expect(labels).toEqual([
-      'T:card.thresholdRatio',
-      'T:card.lastChanceRatio',
       'T:card.reminderThresholdRatio',
+      'T:card.lastChanceRatio',
+      'T:card.thresholdRatio',
       'T:card.retainTokens',
       'T:card.preempt',
     ])
     // Values come from the resolved settings layer, so a field the user never
     // touched still shows the effective number rather than an empty box.
-    const threshold = inputs[0]
-    expect(threshold?.props['value']).toBe('90')
+    // Ladder order: the reminder fires first, then the band, then the rollover.
+    const reminder = inputs[0]
+    expect(reminder?.props['value']).toBe('72')
     const lastChance = inputs[1]
-    expect(lastChance?.props['value']).toBe('10')
-    const reminder = inputs[2]
-    expect(reminder?.props['value']).toBe('60')
+    expect(lastChance?.props['value']).toBe('76')
+    const threshold = inputs[2]
+    expect(threshold?.props['value']).toBe('90')
+    // The firing order is stated on the controls themselves, not only in the
+    // summary below them: the three boxes read as a sequence of numbers, and
+    // 72/3/79 means nothing without the numbers 1, 2 and 3 attached.
+    const tierLabels = elementsOf(expanded)
+      .filter(element => String(element.props['className'] ?? '').includes('dsh-label'))
+      .map(element => String(element.children?.[0] ?? ''))
+    expect(tierLabels[0]?.startsWith('T:card.reminderThresholdRatio')).toBe(true)
+    expect(tierLabels[1]?.startsWith('T:card.lastChanceRatio')).toBe(true)
+    expect(tierLabels[2]?.startsWith('T:card.thresholdRatio')).toBe(true)
     // Retention is the one control whose empty state is meaningful: empty means
     // "keep the deployment's share of the window".
     const retention = inputs[3]
@@ -474,10 +488,10 @@ describe('settings card', () => {
     // shell shows no title tooltip.
     const info = elementsOf(expanded).find(element => element.props['className'] === 'dsh-info')
     expect(info?.props['title']).toBeUndefined()
-    expect(String(info?.props['aria-describedby'])).toContain('dsh-tip-thresholdRatio')
+    expect(String(info?.props['aria-describedby'])).toContain('dsh-tip-reminderThresholdRatio')
     const tip = elementsOf(expanded).find(element => element.props['className'] === 'dsh-tip')
     expect(tip?.props['role']).toBe('tooltip')
-    expect((tip?.children ?? []).join('')).toContain('T:card.thresholdRatio.hint')
+    expect((tip?.children ?? []).join('')).toContain('T:card.reminderThresholdRatio.hint')
     // Explanations are collected on those buttons: no field carries its own
     // hint line, so a card of fields stays scannable.
     const fieldHints = elementsOf(expanded)
@@ -487,14 +501,45 @@ describe('settings card', () => {
     expect(fieldHints).toHaveLength(0)
     expect(loaded.scope.calls).toHaveLength(0)
 
+    // The ladder states the order it fires in, and each tier is reported by the
+    // *point* it opens at. The width of the last stretch is derived arithmetic,
+    // so the two must not be swapped: with tier 2 at 76 and tier 3 at 79 the
+    // summary has to read "opens at 76 (3 wide)", never the reverse.
+    const track = elementsOf(expanded).find(element => element.props['className'] === 'dsh-ladder-track')
+    const tiers = (track?.children ?? []).map(child => String((child as { children?: unknown[] }).children?.[0] ?? ''))
+    expect(tiers).toHaveLength(3)
+    expect(tiers[0]).toContain('T:card.ladder.reminder')
+    expect(tiers[0]).toContain('72')
+    expect(tiers[1]).toContain('"start":76')
+    expect(tiers[1]).toContain('"width":14')
+    // The fixture's user layer raises the execute point to 90, so this reads 90
+    // rather than the composition default: the summary follows the effective
+    // values, not the shipped ones.
+    expect(tiers[2]).toContain('90')
+    // 72 < 76, so nothing is collapsed and the complaint must stay off. This is
+    // the assertion the earlier round lacked: the check used to reconstruct the
+    // warn point by subtracting a width, which made it fire on every healthy
+    // ladder.
+    const note = elementsOf(expanded)
+      .filter(element => String(element.props['className'] ?? '').includes('dsh-ladder-hint'))
+      .concat(elementsOf(expanded))
+      .map(element => String(element.children?.[0] ?? ''))
+      .find(text => text.includes('T:card.ladder.note'))
+    expect(note).toContain('"collapsed":"no"')
+    const ladderNote = elementsOf(expanded)
+      .filter(element => String(element.props['className'] ?? '').includes('dsh-ladder-foot'))
+      .flatMap(foot => elementsOf(foot.children ?? []))
+      .find(element => String(element.props['className'] ?? '').includes('dsh-hint'))
+    expect((ladderNote?.children ?? []).join('')).toContain('T:card.ladder.note')
+
     // Guardrails and tool mounts wait behind the Advanced disclosure.
     const advanced = elementsOf(expanded).find(element => element.props['className'] === 'dsh-advanced')
     ;(advanced?.props['onClick'] as () => void)()
     const withAdvanced = elementsOf(loaded.render(card.component, props)).filter(element => element.type === 'input')
     expect(withAdvanced.map(input => input.props['aria-label'])).toEqual([
-      'T:card.thresholdRatio',
-      'T:card.lastChanceRatio',
       'T:card.reminderThresholdRatio',
+      'T:card.lastChanceRatio',
+      'T:card.thresholdRatio',
       'T:card.retainTokens',
       'T:card.preempt',
       'T:card.notesEnabled',
@@ -526,7 +571,7 @@ describe('settings card', () => {
     expect(text).toContain('T:card.overridden')
   })
 
-  it('refuses a write that would invert the two thresholds before it is sent', () => {
+  it('refuses a reminder that would land at or after the last-chance point', () => {
     const loaded = loadClient()
     const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
     if (card === undefined) throw new Error('no card')
@@ -534,15 +579,45 @@ describe('settings card', () => {
     const collapsed = loaded.render(card.component, props)
     const header = elementsOf(collapsed).find(element => element.props['className'] === 'dsh-head')
     ;(header?.props['onClick'] as () => void)()
-    // The scope's threshold is 0.9, so a reminder of 0.95 is incoherent.
-    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '95')
+
+    // The fixture's last-chance point is 0.76 and the rollover is 0.9. The
+    // boundary is the point itself: 76 is already too late (the engine hands
+    // that step to the last-chance tier), while anything below it is fine. That
+    // comparison is against the *point*, so a card that reconstructed it by
+    // subtracting a width would reject a legal value here.
+    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '76')
     expect(loaded.scope.calls).toHaveLength(0)
     const warned = JSON.stringify(loaded.render(card.component, props))
-    expect(warned).toContain('T:card.invalid.reminder')
+    expect(warned).toContain('T:card.invalid.reminderOrder')
 
-    // A coherent reminder still writes.
-    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '60')
-    expect(loaded.scope.calls.at(-1)).toEqual(['set', 'reminderThresholdRatio', 0.6])
+    // A reminder below the point is legal even when it sits close to it: the
+    // engine's one-point clearance applies to values it derives itself, so a
+    // stated value must not be held to it.
+    typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '73')
+    expect(loaded.scope.calls.at(-1)).toEqual(['set', 'reminderThresholdRatio', 0.73])
+  })
+
+  it('offers no reset at all while every field still holds the deployment value', () => {
+    // The report this answers: a fresh profile shows no reset control, which
+    // reads like a lost button. It is the designed condition — presence in the
+    // user layer marks a field, not a value that differs from the base — so a
+    // card with nothing overridden has nothing to reset, and the control appears
+    // the moment a value is stored.
+    const loaded = loadClient()
+    const card = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    if (card === undefined) throw new Error('no card')
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope }
+    const header = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-head')
+    ;(header?.props['onClick'] as () => void)()
+
+    const buttons = (): string[] => elementsOf(loaded.render(card.component, props))
+      .filter(element => element.type === 'button')
+      .map(element => String(element.props['className'] ?? ''))
+    // The fixture starts with one override, so exactly one per-field reset and
+    // the whole-card reset are offered — never a control with nothing to undo.
+    expect(buttons().filter(name => name === 'dsh-reset')).toHaveLength(1)
+    expect(buttons()).toContain('dsh-reset dsh-reset-deployment')
   })
 
   it('clears every override in one mutation', () => {
@@ -561,9 +636,9 @@ describe('settings card', () => {
     ;(resetAll?.props['onClick'] as () => void)()
     expect(loaded.scope.mutations).toHaveLength(1)
     expect(loaded.scope.mutations[0]).toEqual([
-      { op: 'unset', path: ['thresholdRatio'] },
-      { op: 'unset', path: ['lastChanceRatio'] },
       { op: 'unset', path: ['reminderThresholdRatio'] },
+      { op: 'unset', path: ['lastChanceRatio'] },
+      { op: 'unset', path: ['thresholdRatio'] },
       { op: 'unset', path: ['retainTokens'] },
       { op: 'unset', path: ['preempt'] },
       { op: 'unset', path: ['notesEnabled'] },
@@ -601,7 +676,7 @@ describe('settings card', () => {
     // position.
     expect(text).not.toContain('上面那声哨')
     expect(text).not.toContain('缓冲带')
-    expect(text).toContain('由模型自行判断如何使用')
+    expect(text).toContain('窗口正在变满')
     expect(text).toContain('保留最近对话（Token）')
     expect(text).not.toContain('tokens）')
   })
@@ -720,12 +795,13 @@ describe('settings card', () => {
       .find(element => element.props['className'] === 'dsh-head')
     ;(header?.props['onClick'] as () => void)()
 
-    // The scope's threshold is 0.9 while the reminder box shows 60: the refusal
-    // has to speak in the units the user is looking at, not in raw ratios.
+    // The refusal has to speak in the units the user is looking at, not in raw
+    // ratios: 95 is refused against the 87 the last-chance band opens at, which
+    // is the box pair the user can actually compare.
     typeAndConfirm(loaded, card, props, 'T:card.reminderThresholdRatio', '95')
     const shown = warnings(elementsOf(loaded.render(card.component, props))).join('\n')
     expect(shown).toContain('"reminder":95')
-    expect(shown).toContain('"threshold":90')
+    expect(shown).toContain('"start":76')
   })
 
   it('says nothing when the settled snapshot holds what the write asked for', async () => {
