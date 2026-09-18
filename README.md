@@ -34,24 +34,22 @@ no network calls, no telemetry; the only thing it writes are markdown notes unde
 
 ## Screenshots
 
-**The countdown sits where you already look.** The icon in the session stats row is the mode
-— a recycle mark means this session rolls over, a split square means it keeps its own
-compaction backend — and hovering it says what happens next and how much prompt growth is
-left before it does: `20K tokens to the context notice`, `Notice sent · 60K tokens to the
-last-chance warning`, `Rollover armed · new window in 20K tokens`, or, on a session that will
-be summarised instead, `Compaction in 300K tokens`. The bubble is the app's own tooltip, in
-the app's own colours.
+**The control sits with the session's stats.** The icon in the session stats row is the mode:
+a recycle mark means this session rolls over, a split square means it keeps its own compaction
+backend. Hovering it states what happens next and how much prompt growth is left before it
+does — `20K tokens to the context notice`, `Notice sent · 60K tokens to the last-chance
+warning`, `Rollover armed · new window in 20K tokens`, or, for a session that will be
+summarised, `Compaction in 300K tokens`. The bubble is the app's own tooltip, in the app's own
+colours.
 
 <img src="assets/context-mode-bubble.webp" alt="The rollover control and its hover tooltip" width="620">
 
-Clicking opens a panel rather than switching anything, because the numbers are what a reader
-wants first: where this window stands against its three points, and the switch that changes
-the policy — the only control that does. The bar reads like a signal. Its bands and its ticks
-are green, amber, and red in the order the points fire, so the stretch the window is standing
-in and the point it is heading for are both visible at a glance, and the key under it names
-each tick and the percentage it sits at. Edit a threshold and the bar follows the new
-configuration — it is the effective one, so a shorter ladder draws fewer ticks rather than
-two in the same pixel.
+Clicking opens a panel: where this window stands against its three points, and the switch that
+sets the policy — the only control that does. The bar reads like a signal. Its bands and its
+ticks are green, amber, and red in the order the points fire, so the stretch the window is in
+and the point it is heading for are both visible at a glance; the key under it names each tick
+and the percentage it sits at. The ticks are the effective configuration, so a threshold
+edited in the form moves them with it.
 
 <img src="assets/context-mode-panel.webp" alt="The rollover panel: context used, a tiered bar, the next action, and the switch" width="620">
 
@@ -63,11 +61,10 @@ through (`compaction @ 80%` here), so the rollover threshold can stay below it.
 
 *Screenshots are the app's own UI, in the app's own language; the plugin's text follows it.*
 
-The form has one home per host. On DSH 0.1.6-alpha.2 and later, open **Plugins** in the
-sidebar and pick the `context-rollover` bundle: its configuration is the first thing on its
-page, above its rows. On earlier hosts it is the **Settings → Plugins → Context rollover**
-card. Both are registered at once and each waits for the surface its host declares, so an
-upgrade moves the form without a setting changing.
+The form is the `context-rollover` bundle's own page: open **Plugins** in the sidebar and pick
+the bundle — its configuration is the first thing on the page, above its rows. Hosts that keep
+plugin configuration in Settings draw the same form as the **Settings → Plugins → Context
+rollover** card.
 
 ## Install
 
@@ -190,9 +187,8 @@ distances scale with it:
 | 272K | 214,880 | 195,840 | 206,720 |
 | 128K | 101,120 | 92,160 | 97,280 |
 
-On a 1M window those are comfortable distances. They are the reason the default band is 3%
-rather than the 10% an earlier release shipped: 10% of a million tokens would spend 100,000
-tokens of every window on the final stretch alone.
+On a 1M window those are comfortable distances. They are the reason the band is 3%: 10% of a
+million tokens would spend 100,000 tokens of every window on the final stretch alone.
 
 **On a much smaller window the same shares are far tighter**, and below roughly 180K the
 absolute distances start to matter more than the ratios: 8,960 tokens of reminder-to-rollover
