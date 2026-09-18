@@ -2,202 +2,98 @@
 
 [English](README.md) | 中文
 
-一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 组合包，实现
-**模型驱动的上下文自管理**：模型可以主动结束一个上下文窗口，在全新的窗口里继续，
-全程**不做摘要**。它自己写的笔记和最近几条消息会被带走；其余对话留在会话日志里，
-随时可检索。灵感来自 `openai/codex` 的上下文管理模型。
+一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件，实现
+**由模型自我驱动的上下文自管理**：模型可以主动选择结束当前工作的上下文窗口，写入本地工作笔记，开设全新的上下文窗口，记录笔记路径及旧窗口尾段原文，并继续任务，
+以上过程**区别于传统摘要**。工作笔记构建出本地记忆，随时可召回、检索。灵感来自 `openai/codex` 的上下文管理模型。
 
-本仓库在 athif23 发起的原始
+本仓库在 athif23 发起的原始项目
 [dsh-context-rollover](https://github.com/athif23/dsh-context-rollover) 基础上改写并延续。
 
 ## 有什么用
 
-传统压缩会等窗口快满时，让一个 LLM 把即将丢弃的对话摘要掉。本插件改用干活模型自己写的
-笔记：
+传统压缩会等窗口快满时，让 LLM 把原工作对话摘要后大幅丢弃。本插件改用工作中的模型自己编写笔记：
 
-| | 摘要（`dsh-compaction-basic`） | 滚动（本插件） |
+| | 传统压缩（`dsh-compaction-basic`） | 滚动归档（本插件） |
 |---|---|---|
-| 活下来的是什么 | 一个 LLM 对被丢弃对话的摘要 | 模型自己的笔记、它的交接，以及最近消息的原文 |
-| 什么时候发生 | 计数器一响就切，可能切在任务中途 | 模型自己选的阶段边界 |
-| 被丢弃的对话 | 被摘要掉 | 保留在日志里，可用 `history` 工具检索 |
-| 成本 | 每次压缩多一次 LLM 调用 | 零调用；同样的笔记永远得到同样的检查点 |
+| 原文残留 | LLM 的浓缩摘要、部分最近原文 | 带有全部历史笔记路径的交接文档、部分最近原文 |
+| 触发时点 | 固定式（DSH 默认为窗口的 80% 压力位），可能切在任务中途 | 浮动式，模型在你设置的区间中自行判断中断点 |
+| 丢弃部分 | 摘要外的部分彻底灭失 | 筛选后记录在日志中，可用 `history` 工具检索 |
+| 成本 | 每次压缩需要一次中断及额外 LLM 调用 | 无中断，无额外调用次数：笔记成为任务的一部分 |
 
-一句话：**交接由做过这件事的模型来写，而不是让一个陌生人去猜什么重要。**
+一句值得思考的话：**使用模型中正经手处理这件事的（已激活）专家撰写工作记录，而不是让另一组（陌生）专家重新去猜哪部分更重要。**
 
-它可以装进任意 profile，在每个会话里生效，并与已有的压缩后端并存 —— 它只是抢先一步，
-不替换对方。没有凭据、没有网络调用、没有遥测；唯一写入磁盘的是
-`<dsh home>/notes/<session id>/` 下的 markdown 笔记。
+经过改造，目前滚动归档策略无需繁琐配置，可在每个会话里独立激活，并与官方压缩后端并存 —— 微微抢先一步压低窗口大小，避免触发传统压缩。不替换模块，支持热更新、热卸载。
+
+唯一多出来的部分是你
+`<dsh home>/notes/<session id>/` 下的 markdown 格式工作笔记。
 
 ## 功能展示
 
-**控件就在会话统计行里。** 统计行上的图标*就是*模式：循环箭头代表本会话滚动归档，方块拆分代表
-保留自己的压缩后端。悬停它会说明下一步做什么、还剩多少 Token 增长空间 —— `20K Token后提示`、
-`已提示 · 60K Token后预警`、`自动滚动就位 · 20K Token后强制换窗`，会被摘要的会话则是
-`300K Token后强制压缩`。气泡用的是应用自带的 tooltip 样式与配色。
-
 <img src="assets/context-mode-bubble.webp" alt="滚动归档控件与它的悬停提示" width="620">
 
-点击展开面板：本窗口相对三个点的位置，以及设定策略的开关 —— 只有这个开关会改策略。进度条读起来
-像信号灯，色带与刻度按触发顺序是绿、黄、红，所以窗口处在哪一段、下一个点是哪一个一眼可见；
-下方图例写明每个刻度叫什么、落在百分之几。刻度画的就是生效配置，在表单里改阈值，刻度随之移动。
+<img src="assets/context-mode-panel.webp" alt="滚动归档面板：已用比例、带刻度的进度条、下一步动作预告、以及模式开关" width="620">
 
-<img src="assets/context-mode-panel.webp" alt="滚动归档面板：已用比例、带刻度的进度条、下一步动作、以及模式开关" width="620">
+<img src="assets/rollover-config-form.webp" alt="插件配置表单" width="620">
 
-**旋钮，以及替你算好的算术。** 配置表单可以调滚动阈值、提醒阈值和保留的最近对话，并显示本会话
-实际走的压缩后端（图中是 `compaction @ 80%`），提醒你把滚动阈值保持在它之下。
-
-<img src="assets/rollover-config-form.webp" alt="侧边栏 Plugins 里 context-rollover 页面上的配置表单" width="620">
-
-*截图取自应用本身；界面语言跟随你的设置，插件的文本也一样。*
-
-表单就是 `context-rollover` 这个 bundle 自己的页面：打开侧边栏的 **Plugins**、点开该 bundle，
-配置就在页面最上方、排在它的行之前。把插件配置放在设置里的宿主，画的则是同一张表单，
-位置在 **设置 → 插件配置**。
+参数设置：侧边栏插件菜单 > 已安装 > 点击Context Rollover。
+某些旧的DSH版本：侧边栏设置菜单 > 插件 > 点击Context Rollover
 
 ## 安装
 
-最新版本（插件压缩包就挂在这个 release 上）：
+最新版本（本插件分支使用github release发布.tgz包）：
 
 **https://github.com/mumchristmas/dsh-context-rollover/releases/latest**
 
-你已经在用 DSH，所以直接让会话里的 Agent 装：
+既然你已经在使用 DSH，不如直接让 Agent 动手：
 
 ```text
-请把 dsh-context-rollover 的最新 release 附件下载到当前工作目录，并把它装进我的
-"<profile>" profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
-
-  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.4.0.tgz
-  dsh plugin --profile <profile> add ./dsh-context-rollover-0.4.0.tgz
+获取 mumchristmas/dsh-context-rollover 的最新 release ，使用“dsh plugin add”指令安装至当前运行的DSH配置中，不要使用 npm
 ```
 
-手工执行就是同样两条命令。因为插件组合变了，profile 需要重启一次；之后侧边栏 **Plugins** 里
-`context-rollover` 页面上的配置表单，和输入框下方的滚动归档控件，就是它已经生效的凭证。
+### 支持的 DSH 版本
 
-### 支持的 DSH 宿主线
-
-peer 范围接受本仓库实际构建并测试过的每一条线：
-
-| 线 | 版本 |
-|---|---|
-| 公开 compat 线（npm，`compat/` 中钉死） | `0.1.6-alpha.1` |
-| 同级 checkout 的源码线 | `0.1.0-rc.x`、`0.1.5-rc.x` |
-
-每条范围都写成显式并集 —— `>=0.0.1-rc.1 || >=0.1.0-rc.1 || >=0.1.5-rc.0 || >=0.1.6-alpha.1` —— 因为 semver
-只允许预发布版本满足「`[major, minor, patch]` 三元组本身也带预发布」的比较符。**新增一条宿主
-预发布线必须手工加进这个并集**；没有任何静态范围能接受任意靠后的三元组，`tests/metadata.spec.ts`
-同时钉住了已接受的线和这一限制。范围不带上限，所以未来的大版本会照常安装：与某条线的兼容性由
-「针对它构建并测试」确立，而不是由安装器决定。
-
-`compat/` 里的包刻意钉死到具体版本而不是 `latest`：npm 上 `@deepseek-ai/dsh-*` 的 `latest`
-标签是 `0.0.1-rc.1`，浮动写法会静默地针对一条远古线做检查，`npm run typecheck:compat`
-也就不再是证据。改这些钉死的版本和上面的 peer 并集要同步进行，然后重跑
-`npm run compat:install`。
-
-### 在 DSH 0.1.6 上运行
-
-升级前有两处宿主侧变化值得知道。两处都不需要改插件。
-
-- **会话事件默认上报到 DeepSeek 官方端点。** DSH 0.1.6 把 `session-log-deepseek` 这一行从
-  选择加入改成了默认开启（`enabled` 现在默认 `true`，且 `base` bundle 挂载该行时没有覆盖
-  配置）。当使用 DeepSeek 适配器连接官方端点时，每次请求都会携带「上次确认之后」记录的会话
-  事件 —— 其中包含本插件写入的 `compaction/summary` 与 checkpoint `user/message`，也就是你的
-  笔记与 handoff 文本。若要留在本地，在 profile patch 里显式关掉该行：
-
-  ```yaml
-  - id: session-log-deepseek
-    name: '@deepseek-ai/dsh-session-log-deepseek'
-    config:
-      enabled: false
-  ```
-
-- **DeepSeek 默认改用 Messages 协议。** 如果你手工钉过旧的官方根地址，请移除该覆盖，或改成
-  `https://api.deepseek.com/anthropic`。这件事在这里有影响，是因为路由解析失败会让
-  `requestContext().contextWindow` 取不到值，而没有窗口就没有百分比可算：提醒与自动滚动都会
-  自行让位（显式的 `/rollover now` 和模型的 `new_context` 仍然可用）。
+要求 `0.1.5-rc.x` 以上 
+已于 `0.1.6-alpha.2` 完成兼容测试
 
 ## 怎么用
 
-- **它会自己工作。** 同一条刻度上的三个点，按触发顺序：窗口用到 72% 起，它每窗口提醒模型一次：保存笔记、
-  在干净的节点跨过边界；从 76% 起它会把话说白：**这是最后一段，还剩多少空间，停下来把笔记写完**；
-  到 79% 时它带着笔记和最近消息自动换窗。provider 确认的上下文超限会强制执行同样的换窗，并重试请求。
-- **最后机会是真的。** 最后一段的提醒到来时，前面还留着窗口 3% 的空间，模型有地方回应它 ——
-  仅仅被"告知"过窗口快满的会话从来没有这一步。这条提醒**不移动滚动点**：换窗仍然在 79% 触发，
-  早于其它压缩后端的阈值，否则赢下这个会话的会是摘要。
-- **你正在等的那个请求不会被丢掉。** 一个很长的自主回合会把开启它的那条消息挤出保留尾部；
-  换窗依然会保住那条消息以及它之后的工作，代价是单次换窗腾出的空间更少。
-- **模型可以主动控制。** `new_context` 请求在下一个安全点开新窗口，`notes` 是它自己的
-  工作记忆，`history` 检索已经离开窗口的对话，`get_context_remaining` 报告数字。
-- **你也可以控制。** `/rollover on | off | status | now`，或者会话统计行里的图标按钮
-  （循环箭头 = 滚动，方块拆分 = 标准压缩）。选择是按会话的，能在 reload、fork、resume
-  之后保留。
-- **你能看到留下了什么。** 笔记就是 `<dsh home>/notes/<session id>/` 下的纯 markdown。
-  随便读、随便改、随便留。
-
-笔记目录被当作一条边界，而不只是一个文件夹：笔记路径同时做**词法**与**物理**校验，所以放在
-里面的符号链接无法让一个合法的 `path=linked.md` 读到或覆盖目录外的文件；确实指向目录内的链接
-仍然可用。写入以原子方式替换文件；读不出来的笔记绝不会被当成空文件 —— 它会被报出来，而不是被
-覆盖。两条限制需要说明白：Node 没有 `openat`，解析与打开之间的竞态无法彻底消除；这是单机上的
-按会话目录，不是沙箱。
-
-滚动阈值、提醒阈值、最后机会宽度和保留尾部在 **Plugins → context-rollover** 的配置表单里
-（默认 `thresholdRatio: 0.79`、`lastChanceRatio: 0.76`、`reminderThresholdRatio: 0.72`；保留尾部按 Token 编辑，
-留空表示沿用部署配置里按窗口比例保留的默认值 `retainRatio: 0.1`）。每一项也都能写在插件行
-的 `cordis.yml` 里。三个值都是**点**，表单会把它们按触发顺序编号排成一条刻度，最后一段的宽度
-（79 − 76）作为推导值显示，不需要打开 tooltip 就能看出关系。
-
-### 这套默认值面向大窗口
-
-出厂的这条阶梯是照着当前主流的百万级窗口调的（国内模型尤其如此）。三档全都是窗口的**占比**，
-所以对应的 Token 距离会随窗口一起放大：
-
-| 窗口 | 第 3 档在 79% 执行 | 第 1 档早 70,000 Token 触发 | 第 2 档再早 30,000 开启 |
-|---|---:|---:|---:|
-| 1M | 790,000 | 720,000 | 760,000 |
-| 272K | 214,880 | 195,840 | 206,720 |
-| 128K | 101,120 | 92,160 | 97,280 |
-
-在 1M 上这些距离是宽裕的。这也是带宽取 3% 的原因：100 万 Token 的 10%
-等于每个窗口都要在"最后一段"上花掉 100,000 Token。
-
-**窗口小得多时，同样的占比会紧得多**，而且大约在 18 万以下，起决定作用的就是绝对距离而不是比例了：
-128K 窗口上"提醒到换窗点"只有 8,960 Token，大致就是一次大工具输出的量，一步就可能把窗口从提醒点
-推进到带内甚至越过它，预警拿不到一个可用的回合。如果你跑的是小窗口模型，请把这套默认值当作起点而不是策略，自行探索参数边界 ——
-`get_context_remaining` 会报实时数字，卡片上的阶梯行也会显示每一档当前落在哪里。调高
-`reminderThresholdRatio` 可以拉长预警提前量；调低 `lastChanceRatio` 能给模型留出更多余地；
-保留尾部建议直接按 Token 显式设置，而不是用比例。
-
-请保持 `reminderThresholdRatio + lastChanceRatio ≤ thresholdRatio`，并让滚动阈值严格低于本会话的
-压缩后端（卡片会报出它观测到的最严格阈值）。违反前一条的阶梯不会发出提醒而是被静默压掉 ——
-卡片会在写入前拒绝这种组合。
+- **它会自己工作。** 在三个上下文压力点（可自行配置），触发以下流程：
+    - 越过72%：软性提醒保存笔记，机制预热；
+    - 越过76%：**预警式通知，提示窗口空间余量，完成笔记可自主换窗**；
+    - 达到79%：强制触发换窗。
+- **队列中的请求不会被丢弃。** 换窗会保住那条消息以及它之后的工作。
+- **模型可以主动控制。**
+    - `new_context` 工具用于主动请求换窗
+    - `notes` 工具用于笔记记录
+    - `history` 工具用于对离开窗口的笔记进行检索
+    - `get_context_remaining` 则会报告确切窗口压力指标。
+- **你也可以代为控制。**
+    - `/rollover on | off | status | now`
+    - 或是点击输入框下方的控件图标
+- **你能看到留下了什么。**
+    - 笔记就是 `<dsh home>/notes/<session id>/` 下的纯 markdown 文档。
+    - 随读、随改、随留。
 
 ## 读源码，然后提 issue
 
-这个组合包会改变你的对话如何被管理 —— 别只听 README 的。**把你手边最好的 Agent 拉到
-源码前，一起审计：**
+这个插件会改变你的session管理模式 —— 别只听 README 的。**把你手边最好的 Agent 拉到
+源码前，做一次深入审计。**
 
 ```text
 读一下 github.com/mumchristmas/dsh-context-rollover（从 src/index.ts 和 src/rollover.ts 开始），
 用大白话告诉我它对我的会话做了什么：写了什么文件、调了什么、什么时候触发、有没有风险。
-请引用具体代码。
+请引用具体代码，仔细推理，不要臆造。
 ```
-
-它是一个很小的 TypeScript 包：`src/index.ts`（拦截器、监听器、命令）、
-`src/rollover.ts`（DSH 压缩事务里的表层替换）、`src/checkpoint.ts`（新窗口实际收到
-什么）、`src/notes.ts` 与 `src/history.ts`（两个存储）、`src/tools.ts`（模型能调用的
-工具）、`src/guidance.ts`（它加的唯一一段提示词）、`src/settings.ts` / `src/mode.ts`
-（旋钮与会话开关）、`src/i18n.ts`（英中双语的人面向文本）、`src/client/index.cjs`
-（浏览器按钮）。`src/compat.ts` 桥接两条宿主版本线。
 
 发现了 bug、安全问题，或者不认同的设计？**欢迎提 issue** ——
 https://github.com/mumchristmas/dsh-context-rollover/issues
 
 ## 致谢
 
-感谢 athif23 发起了最初的
-[dsh-context-rollover](https://github.com/athif23/dsh-context-rollover)：它的设计、实验与
-地基都出自他，本仓库在此基础上做了改写与延续。
+再次感谢 athif23 发起了最初的项目
+[dsh-context-rollover](https://github.com/athif23/dsh-context-rollover)
 
-本项目基于 DeepSeek V4.1 Flash 编写，并经过 GPT-6-Astra Max 交叉审计。
+本项目基于 DeepSeek V4.1 Flash 编写（尝试使用DeepSeek推动DeepSeek自身），并经过 GPT-6-Astra Max 交叉审计。
 
 ## 许可证
 
