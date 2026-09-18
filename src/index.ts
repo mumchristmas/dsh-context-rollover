@@ -52,6 +52,7 @@ import {
   LAST_CHANCE_SUMMARY_PREFIX,
   measuredPromptTokens,
   priceCheckpoint,
+  reminderDelivered,
   REMINDER_SUMMARY_PREFIX,
   RolloverRefusedError,
   selectRolloverRange,
@@ -71,8 +72,11 @@ import {
   collectBackendReport,
   readBackendThreshold,
   registerBackendRoute,
+  STOCK_BACKEND_THRESHOLD,
 } from './backends.ts'
 import type { BackendObservation, BackendReport } from './backends.ts'
+import { registerStatusRoute, statusOf } from './status.ts'
+import type { RolloverStatus } from './status.ts'
 import type { PendingRollover } from './state.ts'
 
 /** Cordis plugin name used by loader diagnostics and message-source attribution. */
@@ -123,6 +127,8 @@ export {
   registerBackendRoute,
 } from './backends.ts'
 export type { BackendObservation, BackendReport } from './backends.ts'
+export { readStage, sessionIdFromUrl, statusOf, STATUS_ROUTE } from './status.ts'
+export type { RolloverStage, RolloverStatus } from './status.ts'
 export {
   modeFromArgument,
   modeProjectionDefinition,
@@ -336,6 +342,7 @@ export class RolloverController {
         this.syncOptionalTools()
       })
       registerBackendRoute(ctx, () => this.backendReport())
+      registerStatusRoute(ctx, sessionId => this.statusFor(sessionId))
     } catch (error: unknown) {
       // Hot reload no longer rolls a failed activation back (0.1.6 removed the
       // transaction), so a throw part-way through this sequence would otherwise
@@ -848,6 +855,52 @@ export class RolloverController {
       thresholdRatio: this.config.thresholdRatio,
       reminderThresholdRatio: this.config.reminderThresholdRatio,
       preempt: this.config.preempt,
+    })
+  }
+
+  /**
+   * Where one session's window stands, for the composer's rollover control.
+   *
+   * Every input is host state the browser cannot see: the live measurement
+   * behind the next request, the once-per-window claim the pressure reminder
+   * leaves in the session log, and whether automatic rollover is armed for this
+   * session's realm. The control therefore receives an enum and numbers, and
+   * owns only the words.
+   *
+   * Resolved through `ctx.agents` rather than a map of this controller's own:
+   * an agent registry is keyed by session id and lives exactly as long as its
+   * session, so a control polling a session that has since closed gets a clean
+   * "no reading" instead of a stale countdown — or a map that never shrinks.
+   * @param sessionId - the session the browser control is asking about.
+   * @returns the reading, or null when no live agent owns that session.
+   */
+  private statusFor(sessionId: string): RolloverStatus | null {
+    const registry = (this.ctx as unknown as { get(name: string): unknown }).get('agents') as
+      | { get(id: string): Agent | undefined }
+      | undefined
+    const agent = registry?.get(sessionId)
+    if (agent === undefined) return null
+    const session = agent.session
+    const reading = this.pressureReading(session)
+    const backend = this.otherBackend(agent)
+    // A backend that publishes no threshold still compacts somewhere; the stock
+    // default is what the settings card already names in that case, so the
+    // countdown and the card cannot disagree.
+    const compact = backend === undefined
+      ? undefined
+      : (readBackendThreshold(backend) ?? STOCK_BACKEND_THRESHOLD)
+    return statusOf({
+      mode: this.modeOf(session),
+      armed: this.shouldPreemptAutomatic(agent),
+      promptTokens: reading?.promptTokens ?? null,
+      contextWindow: reading?.contextWindow ?? session.requestContext()?.contextWindow ?? null,
+      notified: reminderDelivered(session),
+      points: {
+        notify: this.config.reminderThresholdRatio,
+        warn: this.config.lastChanceRatio,
+        rollover: this.config.thresholdRatio,
+        compact: compact ?? STOCK_BACKEND_THRESHOLD,
+      },
     })
   }
 

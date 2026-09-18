@@ -1,11 +1,19 @@
 /**
- * Browser half of the plugin: the session-page mode button.
+ * Browser half of the plugin: the session-page mode button and the settings
+ * form.
  *
- * One icon button that sits tight after the session's native stat pills, in
- * their row under the composer. The icon *is* the state: the Lucide recycle
+ * The button is one icon that sits tight after the session's native stat pills,
+ * in their row under the composer. The icon *is* the state: the Lucide recycle
  * mark means this session rolls over, the Lucide square-split-vertical mark
  * means it uses its own compaction backend. Clicking toggles the mode, so
  * there is no separate switch chrome to explain.
+ *
+ * The form is the same tree on two surfaces, because the host moved it. It
+ * registers under `settings.plugin.item` for hosts up to 0.1.6-alpha.1, which
+ * draw it as a card in Settings > Plugins, and under `plugins.bundle.config`
+ * keyed by this bundle's package name from 0.1.6-alpha.2 on, which draws it on
+ * the bundle's own page in the sidebar's Plugins tab. Each registration waits
+ * for its slot to be declared, so a host lights up exactly the one it has.
  *
  * The button reads the mode from the session projection the host half
  * registers and writes it by running the existing `/rollover on|off` command
@@ -16,11 +24,20 @@
  * Geometry is deliberately the native pill's: the same 22px box (a 20px text
  * line plus a 1px pill padding), the same 8px side padding, corner radius and
  * hover affordance, and a 16px glyph so a 24-unit Lucide mark carries the same
- * visual weight as the platform's 16-unit icons. The slot renders into the
- * composer column (`InputBar .root`), whose stats row is a centered box of
- * `--dsh-chat-content-width`: this entry mirrors that box exactly, pulls
- * itself onto the row's line, and measures the last stat pill so the button
- * lands one pill-gap after it instead of at the box edge.
+ * visual weight as the platform's 16-unit icons.
+ *
+ * Placement follows the dock the host draws, and two shapes have shipped. Up to
+ * 0.1.6-alpha.1 the dock slot renders into the composer column (`InputBar
+ * .root`) and the native stats row marks itself with `data-composer-stats`:
+ * this entry mirrors that row's centered box, pulls itself onto the row's line,
+ * and measures the last stat pill so the button lands one pill-gap after it
+ * instead of at the box edge. From 0.1.6-alpha.2 the dock slot renders into the
+ * stats row itself — a centered flex row shared with the context-usage donut —
+ * so this entry is one of its items and the row's own `gap` *is* that pill gap;
+ * there the entry only has to shrink to the button and keep its margins out of
+ * the row's free space. Which shape it is comes from the container's own
+ * computed flex direction rather than from a host version, so a host that
+ * re-draws the row needs no change here.
  *
  * Authored as CommonJS because the artifact runs inside the shell's loader
  * factory, which hands the bundle a `require` bound to the browser module
@@ -32,6 +49,22 @@
 
 const { createElement, useEffect, useLayoutEffect, useRef, useState } = require('react')
 
+/**
+ * `createPortal`, when the shell's module table carries React's DOM renderer.
+ *
+ * It is a platform seed word rather than a package row, so every host that can
+ * render this control has it; the guard is here because a bundle that throws
+ * while loading takes the whole browser half down with it, and an overlay drawn
+ * in place is a far better failure than no control at all.
+ */
+const createPortal = (() => {
+  try {
+    return require('react-dom').createPortal
+  } catch {
+    return undefined
+  }
+})()
+
 /** Projection key the host half publishes the per-session mode under. */
 const MODE_PROJECTION_KEY = 'contextRolloverMode'
 
@@ -41,11 +74,56 @@ const SLOT = 'conversation.composer.dock'
 /** Settings namespace the host half registers; the card's join key. */
 const SETTINGS_NS = 'context-rollover'
 
-/** Slot the settings card occupies (`settings.plugin.item`, keyed by namespace). */
-const SETTINGS_SLOT = 'settings.plugin.item'
+/** Bundle package name: the key `plugins.bundle.config` dispatches. */
+const BUNDLE_NAME = 'dsh-context-rollover'
+
+/**
+ * Legacy slot for the card: the Settings > Plugins section, keyed by namespace.
+ * Hosts up to 0.1.6-alpha.1 declare it. 0.1.6-alpha.2 dropped the declaration —
+ * Settings keeps only the read-only plugin inventory now — so a registration
+ * here simply waits, forever, on a host that never declares it.
+ */
+const LEGACY_SETTINGS_SLOT = 'settings.plugin.item'
+
+/**
+ * Current slot for the card: a bundle's own configuration, keyed by the
+ * bundle's package name and rendered on the bundle's page in the sidebar's
+ * Plugins tab. Declared by `@deepseek-ai/dsh-client-ui-plugin-manager` from
+ * 0.1.6-alpha.2 on.
+ */
+const BUNDLE_CONFIG_SLOT = 'plugins.bundle.config'
 
 /** Host route carrying what is known about the surrounding compaction backends. */
 const BACKEND_ROUTE = '/context-rollover/backends'
+
+/** Host route carrying one session's rollover reading. */
+const STATUS_ROUTE = '/context-rollover/status'
+
+/**
+ * How often the control re-reads the host while it is on screen.
+ *
+ * The reading is not pushable: it is built from the live measurement behind the
+ * next request, which is host state no session event carries, and it moves
+ * between steps as the conversation grows. Five seconds is short enough that a
+ * countdown looks live and long enough that the measurement it costs — the same
+ * one every step already takes — stays negligible.
+ */
+const STATUS_POLL_MS = 5000
+
+/** Delay before the hover bubble appears, the platform's own hover patience. */
+const TOOLTIP_DELAY_MS = 300
+
+/** Gap between the trigger and the overlay above it. */
+const OVERLAY_GAP = 10
+
+/** Panel width, matching the platform's usage panel. */
+const PANEL_WIDTH = 264
+
+/** Leave room below the panel when there is not enough above the trigger. */
+const PANEL_FLIP_BELOW_UNDER = 260
+
+/** Minimum inset an overlay keeps from the viewport's sides. */
+const OVERLAY_MARGIN = 12
 
 /** Stylesheet tag id; also the class prefix below. */
 const STYLE_ID = 'dsh-context-rollover-mode'
@@ -69,6 +147,28 @@ const DICTS = {
     'tip.compact': 'Standard compaction: this session keeps its own compaction backend and summarises. '
       + 'Click to intercept it with a rollover.',
     'mode.failed': 'Mode not changed:',
+    // The control's hover bubble: one sentence saying what happens next and how
+    // much prompt growth is left before it does. `{tokens}` is already
+    // abbreviated, so the unit is the translator's to place.
+    'stage.notify': '{tokens} tokens to the context notice',
+    'stage.warn': 'Notice sent · {tokens} tokens to the last-chance warning',
+    'stage.rollover': 'Rollover armed · new window in {tokens} tokens',
+    'stage.imminent': 'Rollover armed · the next safe boundary starts a new window',
+    'stage.compacting': 'Compaction in {tokens} tokens',
+    'stage.unknown': 'Context window not measured yet',
+    // The panel. `usedBefore`/`usedAfter` split the native phrasing so both
+    // languages can put the number where their grammar wants it.
+    'panel.usedBefore': '',
+    'panel.usedAfter': 'of context used',
+    'panel.unknown': 'Context window',
+    'panel.point.notify': 'Notify',
+    'panel.point.warn': 'Warn',
+    'panel.point.rollover': 'Roll over',
+    'panel.point.compact': 'Compaction',
+    'panel.switch': 'Roll over this session',
+    'panel.switchHint': 'Off hands the window back to the session\'s own compaction backend.',
+    'panel.writeFailed': 'Mode not changed:',
+    'panel.pending': 'Applying…',
     'card.title': 'Context Rollover',
     'card.expand': 'Expand',
     'card.collapse': 'Collapse',
@@ -148,6 +248,23 @@ const DICTS = {
     'tip.rollover': '滚动归档：到阈值时开新窗口，用检查点 + 最近原文替代摘要。点击切换为标准压缩。',
     'tip.compact': '标准压缩（Compact）：由本会话自己的压缩器在它的阈值处摘要。点击切换为滚动归档。',
     'mode.failed': '模式未切换：',
+    'stage.notify': '{tokens} Token后提示',
+    'stage.warn': '已提示 · {tokens} Token后预警',
+    'stage.rollover': '自动滚动就位 · {tokens} Token后强制换窗',
+    'stage.imminent': '自动滚动就位 · 下一个安全边界即开新窗口',
+    'stage.compacting': '{tokens} Token后强制压缩',
+    'stage.unknown': '尚未测量上下文窗口',
+    'panel.usedBefore': '上下文已用',
+    'panel.usedAfter': '',
+    'panel.unknown': '上下文窗口',
+    'panel.point.notify': '提示',
+    'panel.point.warn': '预警',
+    'panel.point.rollover': '换窗',
+    'panel.point.compact': '压缩',
+    'panel.switch': '本会话滚动归档',
+    'panel.switchHint': '关闭后交还给本会话自己的压缩后端。',
+    'panel.writeFailed': '模式未切换：',
+    'panel.pending': '正在应用…',
     'card.title': 'Context Rollover',
     'card.expand': '展开',
     'card.collapse': '收起',
@@ -291,6 +408,18 @@ const CSS = `
    underneath and own their own clicks. Only the button opts back in. */
 .dsh-context-rollover-mode { pointer-events: none; }
 .dsh-context-rollover-mode > button { pointer-events: auto; }
+/* From 0.1.6-alpha.2 the dock is a centered flex *row* and this entry is one of
+   its items, beside the native pills and the context-usage donut. The row's own
+   12px gap is the pill gap, so the entry shrinks to the button and takes no side
+   margin: width 100% would eat the row and push the button into the middle of
+   the band, ahead of the donut, and an auto side margin would swallow the free
+   space justify-content: center needs, stranding the pills at the left edge.
+   The measured overlay below belongs to the older column dock only. */
+.dsh-context-rollover-mode.dsh-in-dock {
+  width: auto;
+  margin: 0;
+  justify-content: flex-start;
+}
 /* The native stat pill's box: 1px padding + a 20px (+ text-tier delta) line. */
 .dsh-context-rollover-mode > button {
   display: inline-flex;
@@ -325,6 +454,160 @@ const CSS = `
 }
 .dsh-context-rollover-mode > button[disabled] { opacity: 0.5; cursor: default; }
 .dsh-context-rollover-mode > button[disabled]:hover { background: transparent; }
+
+/* The control's two overlays. Both are chrome copied from the platform's own
+   components — the hover bubble is the Tooltip primitive's box and the panel is
+   the context-usage panel's — because a plugin may not import those components,
+   and both are built from the theme's tokens so they follow it anyway. They are
+   fixed-position and rendered at the end of this entry, which its own ancestors
+   leave viewport-positioned: none of them carries a transform, filter, or
+   containment. */
+.dsh-context-rollover-bubble {
+  position: fixed;
+  z-index: 100;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: 50vw;
+  padding: 3px 7px;
+  border-radius: 8px;
+  background: var(--dsw-alias-tooltip-bg);
+  color: var(--dsw-static-neutral-bluish-00, #fff);
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre-line;
+  overflow-wrap: break-word;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+.dsh-context-rollover-panel {
+  position: fixed;
+  z-index: 100;
+  box-sizing: border-box;
+  padding: 12px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--dsw-specific-menu);
+  box-shadow: var(--dsw-elevation-prominent);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 20px;
+  cursor: default;
+  /* The entry it hangs from is click-through so the native pills keep their own
+     clicks; the panel is not, or its switch would not be. */
+  pointer-events: auto;
+  transform: translateX(-50%);
+}
+.dsh-context-rollover-panel .dsh-panel-head { display: flex; align-items: center; gap: 6px; }
+.dsh-context-rollover-panel .dsh-panel-headline { color: var(--dsw-alias-label-tertiary); }
+.dsh-context-rollover-panel .dsh-panel-percent { color: var(--dsw-alias-label-primary); font-weight: 500; }
+.dsh-context-rollover-panel .dsh-panel-figures {
+  margin-left: auto; font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-primary); font-weight: 500;
+}
+.dsh-context-rollover-panel .dsh-bar {
+  position: relative; height: 6px; margin: 10px 0 6px;
+  border-radius: 999px; background: var(--dsw-alias-interactive-bg-hover); overflow: hidden;
+}
+/* The window as four rungs, read like a signal: quiet up to the notify point,
+   green up to the warn point, amber up to the execute point, red past it. The
+   band tints say which stretch the window is standing in; the ticks are the
+   same three colours in the same order, so the bar reads at a glance without
+   the key under it. */
+.dsh-context-rollover-panel .dsh-bar-used {
+  position: absolute; top: 0; left: 0; height: 100%; border-radius: 999px;
+  background: var(--dsw-static-blue-450, #2f6fed); transition: width .24s ease;
+  /* Above the bands: what is already used overrides what each rung would be.
+     The ticks stay above this, so a point already crossed keeps its colour. */
+  z-index: 1;
+}
+.dsh-context-rollover-panel .dsh-bar-zone { position: absolute; top: 0; height: 100%; }
+.dsh-context-rollover-panel .dsh-bar-zone[data-zone='notified'] {
+  background: var(--dsw-static-green-100, #e6faed);
+}
+.dsh-context-rollover-panel .dsh-bar-zone[data-zone='lastChance'] {
+  background: var(--dsw-static-amber-100, #fef5e7);
+}
+.dsh-context-rollover-panel .dsh-bar-zone[data-zone='past'] {
+  background: var(--dsw-static-red-100, #fee2e2);
+}
+.dsh-context-rollover-panel .dsh-bar-mark {
+  position: absolute; top: 0; width: 2px; height: 100%; z-index: 2;
+  background: var(--dsw-alias-label-tertiary);
+}
+.dsh-context-rollover-panel .dsh-bar-mark[data-mark='notify'] {
+  background: var(--dsw-alias-state-success-primary);
+}
+.dsh-context-rollover-panel .dsh-bar-mark[data-mark='warn'] {
+  background: var(--dsw-alias-state-warn-primary);
+}
+.dsh-context-rollover-panel .dsh-bar-mark[data-mark='rollover'],
+.dsh-context-rollover-panel .dsh-bar-mark[data-mark='compact'] {
+  background: var(--dsw-alias-state-error-primary);
+}
+/* The key under the bar: which rung is which, and where each one sits. The
+   percentages are the tick positions, so a mark never has to be read off the
+   bar's own geometry. */
+.dsh-context-rollover-panel .dsh-bar-keys {
+  display: flex; align-items: center; gap: 10px; margin: 0 0 10px;
+  color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px;
+}
+.dsh-context-rollover-panel .dsh-bar-key { display: inline-flex; align-items: center; gap: 4px; }
+.dsh-context-rollover-panel .dsh-key-dot {
+  flex: none; width: 6px; height: 6px; border-radius: 2px; background: var(--dsw-alias-label-tertiary);
+}
+.dsh-context-rollover-panel .dsh-bar-key[data-point='notify'] .dsh-key-dot {
+  background: var(--dsw-alias-state-success-primary);
+}
+.dsh-context-rollover-panel .dsh-bar-key[data-point='warn'] .dsh-key-dot {
+  background: var(--dsw-alias-state-warn-primary);
+}
+.dsh-context-rollover-panel .dsh-bar-key[data-point='rollover'] .dsh-key-dot,
+.dsh-context-rollover-panel .dsh-bar-key[data-point='compact'] .dsh-key-dot {
+  background: var(--dsw-alias-state-error-secondary);
+}
+/* The rung the window is heading for reads at full strength; the ones already
+   behind it are context rather than a call to action. */
+.dsh-context-rollover-panel .dsh-bar-key[data-next] { color: var(--dsw-alias-label-primary); }
+.dsh-context-rollover-panel .dsh-bar-key[data-passed] { opacity: 0.55; }
+.dsh-context-rollover-panel .dsh-stage { display: flex; align-items: flex-start; gap: 6px; padding: 2px 0; }
+.dsh-context-rollover-panel .dsh-stage-dot {
+  flex: none; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%;
+  background: var(--dsw-alias-label-tertiary);
+}
+.dsh-context-rollover-panel .dsh-stage-text { min-width: 0; }
+.dsh-context-rollover-panel .dsh-stage[data-stage='warn'] .dsh-stage-dot {
+  background: var(--dsw-alias-state-warn-primary);
+}
+.dsh-context-rollover-panel .dsh-stage[data-stage='rollover'] .dsh-stage-dot {
+  background: var(--dsw-alias-state-business-primary);
+}
+.dsh-context-rollover-panel .dsh-stage[data-stage='imminent'] .dsh-stage-dot {
+  background: var(--dsw-alias-state-error-primary);
+}
+.dsh-context-rollover-panel .dsh-switch-row {
+  display: flex; align-items: center; gap: 8px; margin-top: 10px; padding-top: 10px;
+  border-top: 0.5px solid var(--dsw-alias-border-l1);
+}
+.dsh-context-rollover-panel .dsh-switch-label { min-width: 0; color: var(--dsw-alias-label-primary); }
+.dsh-context-rollover-panel button.dsh-switch {
+  position: relative; flex: none; margin-left: auto; box-sizing: border-box;
+  width: 36px; height: 20px; padding: 2px; border: 0; border-radius: 10px;
+  corner-shape: round; background: var(--dsw-alias-border-l3); cursor: pointer;
+}
+.dsh-context-rollover-panel button.dsh-switch[aria-checked='true'] { background: var(--dsw-alias-brand-primary); }
+.dsh-context-rollover-panel button.dsh-switch:disabled { opacity: 0.5; cursor: default; }
+.dsh-context-rollover-panel button.dsh-switch:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px;
+}
+.dsh-context-rollover-panel .dsh-thumb {
+  display: block; width: 16px; height: 16px; border-radius: 50%; corner-shape: round;
+  background: var(--dsw-alias-label-primary-foreground); transition: transform .12s ease;
+}
+.dsh-context-rollover-panel button.dsh-switch[aria-checked='true'] .dsh-thumb { transform: translateX(16px); }
+.dsh-context-rollover-panel .dsh-panel-hint {
+  margin: 4px 0 0; color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 16px;
+}
+.dsh-context-rollover-panel .dsh-warn { margin: 6px 0 0; color: var(--dsw-alias-label-error, #d33); }
 /* Settings card. The section renders a registered card bare, so this half owns
    its chrome — reproduced from the section's own PluginCard look, whose CSS a
    plugin may not import. */
@@ -339,6 +622,21 @@ const CSS = `
 .dsh-context-rollover-card.dsh-open {
   background: var(--dsw-alias-bg-layer-2);
   border-color: var(--dsw-alias-label-dimmed);
+}
+/* On the Plugins page the bundle's own section is the frame: the page draws the
+   title, the icon, and the crumb above it, so the card keeps the form's styles
+   and gives up its chrome and its header. The body's own top border and side
+   margins go with it — there is no header left for them to belong to. */
+.dsh-context-rollover-card.dsh-page {
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 0;
+}
+.dsh-context-rollover-card.dsh-page .dsh-body {
+  border-top: 0;
+  margin: 0;
+  padding-bottom: 0;
 }
 .dsh-context-rollover-card > button.dsh-head {
   width: 100%; appearance: none; border: 0; background: none; font: inherit; color: inherit;
@@ -500,29 +798,94 @@ function CompactIcon() {
 }
 
 /**
- * Measure the right padding that puts the button one pill-gap after the last
- * native stat pill: this entry and the stats row share the same centered box,
- * so their right edges coincide and the offset is entirely padding.
- * @param ref - ref to this entry's root element.
- * @returns the padding in px, or undefined while it cannot be measured.
+ * The element the host actually lays this entry out in.
+ *
+ * The slot outlet is `display: contents` — it generates no box of its own — so
+ * the entry's real parent, the one whose flex rules place it, is the first
+ * ancestor that does generate one.
+ * @param entry - this entry's root element.
+ * @returns that ancestor, or null when the walk leaves the document or the
+ *   computed style cannot be read at all.
  */
-function useAdjacentPadding(ref) {
-  const [paddingRight, setPaddingRight] = useState(undefined)
+function layoutContainer(entry) {
+  if (typeof getComputedStyle !== 'function') return null
+  let container = entry.parentElement
+  while (container !== null && container !== undefined
+    && getComputedStyle(container).display === 'contents') {
+    container = container.parentElement
+  }
+  return container ?? null
+}
+
+/**
+ * How the host's composer lays this entry out.
+ *
+ * Two layouts have shipped, and they place this entry differently enough that
+ * the button cannot be positioned the same way in both. Up to 0.1.6-alpha.1 the
+ * dock slot renders as a child of the composer root — a *column* flex box — and
+ * the native stats row marks itself with `data-composer-stats`: this entry then
+ * spans the row's centered box and has to be pulled onto its line and padded so
+ * the button clears the last pill. From 0.1.6-alpha.2 the dock slot renders as a
+ * child of the stats row itself — a centered *row* flex box — so this entry is
+ * simply one of its items and the row's own gap already puts the button one
+ * pill-gap after the pills.
+ * @param entry - this entry's root element.
+ * @returns `'row'` for the flex-row dock, `'column'` for the older dock, or
+ *   undefined when the container cannot be read.
+ */
+function dockLayout(entry) {
+  const container = layoutContainer(entry)
+  if (container === null) return undefined
+  const style = getComputedStyle(container)
+  if (!style.display.includes('flex')) return 'column'
+  return style.flexDirection === 'row' ? 'row' : 'column'
+}
+
+/**
+ * How this entry is positioned, decided from the host's own layout.
+ *
+ * `dock` needs no measurement: the entry is a flex item, so the row places it
+ * and the entry must only stay out of the way. `overlay` is the older shape —
+ * mirror the stats row's centered box, then pad it so the button lands one
+ * pill-gap after the last pill. `plain` is the fallback for a column dock with
+ * no stats row to align to: the entry keeps its full width and no offset, which
+ * is what a host that draws neither will look least wrong with.
+ * @param ref - ref to this entry's root element.
+ * @returns the alignment: its `layout`, and the `paddingRight` overlay needs.
+ */
+function useDockAlignment(ref) {
+  const [alignment, setAlignment] = useState({ layout: undefined, paddingRight: undefined })
   useLayoutEffect(() => {
     const entry = ref.current
-    const row = typeof document === 'undefined' ? null : document.querySelector('[data-composer-stats]')
-    if (entry === null || entry === undefined || row === null) return undefined
+    if (entry === null || entry === undefined || typeof document === 'undefined') return undefined
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => { measure() })
     // Re-measured on resize and on any stat pill geometry change, because the
     // numbers in those pills grow and shift the row's centre.
     function measure() {
       const button = entry.firstElementChild
       if (button === null) return
+      if (dockLayout(entry) === 'row') {
+        // Nothing to measure here: the entry is as wide as the button and the
+        // row's gap places it, so a pill that grows re-centres the row without
+        // changing this offset. Stop watching the pills.
+        if (observer !== null) observer.disconnect()
+        setAlignment({ layout: 'dock', paddingRight: undefined })
+        return
+      }
+      const row = document.querySelector('[data-composer-stats]')
+      if (row === null) {
+        if (observer !== null) observer.disconnect()
+        setAlignment({ layout: 'plain', paddingRight: undefined })
+        return
+      }
       const last = row.lastElementChild
       const anchorRight = (last === null ? row : last).getBoundingClientRect().right
       const buttonWidth = button.getBoundingClientRect().width
       const boxRight = entry.getBoundingClientRect().right
-      setPaddingRight(Math.max(0, Math.round(boxRight - anchorRight - PILL_GAP - buttonWidth)))
+      setAlignment({
+        layout: 'overlay',
+        paddingRight: Math.max(0, Math.round(boxRight - anchorRight - PILL_GAP - buttonWidth)),
+      })
       if (observer !== null) {
         observer.observe(row)
         for (const child of row.children) observer.observe(child)
@@ -535,7 +898,171 @@ function useAdjacentPadding(ref) {
       if (typeof window !== 'undefined') window.removeEventListener('resize', measure)
     }
   }, [])
-  return paddingRight
+  return alignment
+}
+
+/**
+ * A token count in the shape the composer's own pills use: one decimal, an SI
+ * suffix from a thousand up, and no trailing `.0` — the platform prints `1M`,
+ * not `1.0M`.
+ * @param value - the count, or null while nothing is measured.
+ * @returns the abbreviated count, or null.
+ */
+function formatTokens(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  const rounded = Math.max(0, Math.round(value))
+  if (rounded < 1000) return String(rounded)
+  const suffix = rounded < 1000000 ? 'K' : 'M'
+  const text = (rounded / (suffix === 'K' ? 1000 : 1000000)).toFixed(1)
+  return `${text.endsWith('.0') ? text.slice(0, -2) : text}${suffix}`
+}
+
+/**
+ * The control's one sentence: what happens next, and how much prompt growth is
+ * left before it does.
+ *
+ * The stage names the action rather than the tier number, because the tier
+ * numbers are the settings card's vocabulary and the countdown is the only
+ * thing a reader wants here.
+ * @param t - this namespace's translator.
+ * @param status - the host's reading, or undefined before the first one lands.
+ * @returns the sentence to show in the bubble and the panel.
+ */
+function stageText(t, status) {
+  if (status === undefined || status === null) return t('stage.unknown')
+  const tokens = formatTokens(status.tokensToNext)
+  // A stage whose countdown cannot be measured yet still knows what it is
+  // waiting for, and the sentence is the same one with the number left out.
+  const values = { tokens: tokens === null ? '—' : tokens }
+  switch (status.stage) {
+    case 'warn':
+      return t('stage.warn', values)
+    case 'rollover':
+      return t('stage.rollover', values)
+    case 'imminent':
+      return t('stage.imminent')
+    case 'compacting':
+      return t('stage.compacting', values)
+    default:
+      return t('stage.notify', values)
+  }
+}
+
+/**
+ * Poll one session's reading from the host.
+ *
+ * Polled rather than pushed because the number is not in the session log: it is
+ * the token meter's live measurement of the prompt the next request would
+ * submit, which moves as the conversation grows and not on any event. The poll
+ * runs only while this control is mounted and the document is visible, so a
+ * background tab costs nothing.
+ *
+ * `watch` restarts the loop, which is what makes the reading current at the
+ * moment it is looked at: opening the panel reads once immediately instead of
+ * waiting out the interval, so the marks a reader is about to compare against
+ * the configuration are never a poll behind it.
+ * @param sessionId - the session to read, when the slot bound one.
+ * @param watch - a value whose change means "read again now".
+ * @returns the newest reading, or undefined before one arrives.
+ */
+function useRolloverStatus(sessionId, watch) {
+  const [status, setStatus] = useState(undefined)
+  useEffect(() => {
+    if (typeof sessionId !== 'string' || sessionId === '' || typeof fetch !== 'function') return undefined
+    let alive = true
+    let timer
+    const read = () => {
+      fetch(`${STATUS_ROUTE}?session=${encodeURIComponent(sessionId)}`, {
+        headers: { accept: 'application/json' },
+      }).then(response => (response.ok ? response.json() : null))
+        .then(value => {
+          // A 404 body is `null`: the host has no live session for this id, so
+          // the control keeps the mode it already knows and drops the countdown.
+          if (alive) setStatus(value === null || typeof value !== 'object' ? undefined : value)
+        })
+        .catch(() => undefined)
+    }
+    const schedule = () => {
+      clearTimeout(timer)
+      if (typeof document !== 'undefined' && document.hidden === true) return
+      timer = setTimeout(() => {
+        read()
+        schedule()
+      }, STATUS_POLL_MS)
+    }
+    read()
+    schedule()
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
+  }, [sessionId, watch])
+  return status
+}
+
+/**
+ * Where an overlay anchored to the trigger goes, in viewport coordinates.
+ *
+ * Measured from the trigger's own rect on every open and on every resize or
+ * scroll, because the composer moves with the conversation: a panel placed once
+ * would hang in the wrong place the moment the transcript scrolls. It prefers
+ * the space above the trigger — where the platform's own usage panel goes — and
+ * flips below when there is not enough of it.
+ * @param anchor - ref to the trigger button.
+ * @param visible - whether an overlay is on screen at all.
+ * @param width - the box width to reserve and clamp to, or 0 for an overlay
+ *   that sizes itself (the hover bubble, which centres on the trigger and lets
+ *   its own `max-content`/`max-width` decide how wide it is).
+ * @returns the fixed-position style for the overlay, or undefined while hidden.
+ */
+function useOverlayPlacement(anchor, visible, width) {
+  const [placement, setPlacement] = useState(undefined)
+  useLayoutEffect(() => {
+    if (!visible) {
+      setPlacement(undefined)
+      return undefined
+    }
+    const element = anchor.current
+    if (element === null || element === undefined || typeof window === 'undefined') return undefined
+    const place = () => {
+      const box = element.getBoundingClientRect()
+      const centre = box.left + box.width / 2
+      const fitted = Math.min(width, window.innerWidth - 2 * OVERLAY_MARGIN)
+      // A box that sizes itself only has to keep its centre on screen; one with
+      // a width of its own is clamped so neither edge leaves the viewport.
+      const left = width > 0
+        ? Math.min(
+            Math.max(OVERLAY_MARGIN + fitted / 2, centre),
+            Math.max(OVERLAY_MARGIN + fitted / 2, window.innerWidth - OVERLAY_MARGIN - fitted / 2),
+          )
+        : centre
+      setPlacement({
+        left: `${Math.round(left)}px`,
+        ...(box.top < PANEL_FLIP_BELOW_UNDER
+          ? { top: `${Math.round(box.bottom + OVERLAY_GAP)}px` }
+          : { bottom: `${Math.round(window.innerHeight - box.top + OVERLAY_GAP)}px` }),
+        ...(width > 0 ? { width: `${Math.round(fitted)}px` } : {}),
+      })
+    }
+    place()
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, true)
+    return () => {
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place, true)
+    }
+  }, [visible, width])
+  return placement
+}
+
+/**
+ * Draw an overlay through the shell's portal when it has one.
+ * @param node - the overlay element.
+ * @returns the node, portalled to the document body when that is possible.
+ */
+function overlay(node) {
+  if (createPortal === undefined || typeof document === 'undefined' || document.body === undefined) return node
+  return createPortal(node, document.body)
 }
 
 /**
@@ -550,7 +1077,40 @@ function RolloverModeButton(props) {
     ? props.useProjection(MODE_PROJECTION_KEY)
     : undefined
   const ref = useRef(null)
-  const paddingRight = useAdjacentPadding(ref)
+  /** The trigger itself, which the overlays are anchored to. */
+  const anchor = useRef(null)
+  const alignment = useDockAlignment(ref)
+  const [open, setOpen] = useState(false)
+  const status = useRolloverStatus(props.sessionId, open)
+  const [hovering, setHovering] = useState(false)
+  const bubbleShown = useDelayedFlag(hovering && !open, TOOLTIP_DELAY_MS)
+  // Only the panel claims a width; the bubble sizes itself and centres on the
+  // trigger, the way the platform's own tooltips do.
+  const placement = useOverlayPlacement(anchor, open || bubbleShown, open ? PANEL_WIDTH : 0)
+  // Closing on an outside press and on Escape, the way every popover in the
+  // shell does. Read from the document because the panel is portalled out of
+  // this entry, so a press inside it is not inside the entry's subtree.
+  useEffect(() => {
+    if (!open || typeof document === 'undefined') return undefined
+    const onDown = event => {
+      const target = event.target
+      if (contains(ref.current, target)) return
+      const panel = target === null || target === undefined || typeof target.closest !== 'function'
+        ? null
+        : target.closest('.dsh-context-rollover-panel')
+      if (panel !== null) return
+      setOpen(false)
+    }
+    const onKey = event => {
+      if (event.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', onDown, true)
+    document.addEventListener('keydown', onKey, true)
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true)
+      document.removeEventListener('keydown', onKey, true)
+    }
+  }, [open])
   /** Synchronous latch: `pending` state alone is batched and can read stale. */
   const inFlight = useRef(false)
   const [pending, setPending] = useState(false)
@@ -559,11 +1119,12 @@ function RolloverModeButton(props) {
   if (mode !== 'rollover' && mode !== 'compact') return null
   const rollover = mode === 'rollover'
   ensureStyles()
-  const hasStatsRow = typeof document !== 'undefined'
-    && document.querySelector('[data-composer-stats]') !== null
+  const inDock = alignment.layout === 'dock'
   const style = {
-    ...(paddingRight === undefined ? {} : { paddingRight: `${paddingRight}px` }),
-    ...(hasStatsRow ? { marginTop: ROW_LINE_PULL } : {}),
+    ...(alignment.paddingRight === undefined ? {} : { paddingRight: `${alignment.paddingRight}px` }),
+    // Only the column dock needs the entry pulled up onto the stats row's line;
+    // the row dock already centres its items.
+    ...(alignment.layout === 'overlay' ? { marginTop: ROW_LINE_PULL } : {}),
   }
   /**
    * Ask for the other mode and report what came back.
@@ -608,18 +1169,195 @@ function RolloverModeButton(props) {
       role: 'status',
     }, error))
   }
+  const sentence = stageText(t, status)
   children.push(createElement('button', {
     key: 'mode',
+    ref: anchor,
     type: 'button',
     'data-context-rollover-mode': mode,
     'data-context-rollover-pending': pending ? '' : undefined,
     disabled: pending,
-    'aria-pressed': rollover,
-    'aria-label': t(rollover ? 'aria.rollover' : 'aria.compact'),
-    title: error ?? t(rollover ? 'tip.rollover' : 'tip.compact'),
-    onClick: () => request(!rollover),
+    'aria-haspopup': 'dialog',
+    'aria-expanded': open,
+    'aria-label': `${t(rollover ? 'aria.rollover' : 'aria.compact')} — ${sentence}`,
+    onClick: () => { setOpen(!open) },
+    onMouseEnter: () => { setHovering(true) },
+    onMouseLeave: () => { setHovering(false) },
   }, rollover ? RolloverIcon() : CompactIcon()))
-  return createElement('div', { className: 'dsh-context-rollover-mode', ref, style }, ...children)
+  if (placement !== undefined && bubbleShown) {
+    children.push(createElement('span', {
+      key: 'bubble',
+      className: 'dsh-context-rollover-bubble',
+      role: 'tooltip',
+      style: placement,
+    }, sentence))
+  }
+  if (placement !== undefined && open) children.push(modePanel({
+    key: 'panel',
+    t,
+    status,
+    placement,
+    rollover,
+    pending,
+    error,
+    sentence,
+    onToggle: () => request(!rollover),
+  }))
+  return createElement('div', {
+    className: inDock ? 'dsh-context-rollover-mode dsh-in-dock' : 'dsh-context-rollover-mode',
+    ref,
+    style,
+  }, ...children)
+}
+
+/**
+ * A flag that follows its input after a delay, and drops the moment it does.
+ *
+ * The platform's tooltips wait for the pointer to settle before appearing but
+ * leave at once, which is the difference between a hint and a flicker as the
+ * pointer crosses the composer's pills on the way somewhere else.
+ * @param active - whether the flag is being asked for.
+ * @param delay - milliseconds to wait before raising it.
+ * @returns whether the flag is raised yet.
+ */
+function useDelayedFlag(active, delay) {
+  const [shown, setShown] = useState(false)
+  useEffect(() => {
+    if (!active) {
+      setShown(false)
+      return undefined
+    }
+    const timer = setTimeout(() => setShown(true), delay)
+    return () => clearTimeout(timer)
+  }, [active])
+  return shown
+}
+
+/**
+ * The panel a click opens: where the window stands, and the one control that
+ * changes what happens when it fills.
+ *
+ * The mode is no longer toggled by the button itself — a click belongs to the
+ * reader who wants the numbers — so the switch is the only way to change it,
+ * and it shows which mode is on rather than which one a click would select.
+ * @param props - the reading, the placement, and the control's callbacks.
+ * @returns the panel element, portalled when the shell can portal.
+ */
+function modePanel(props) {
+  const { t, status, placement, rollover, pending, error, sentence, onToggle } = props
+  const used = status !== undefined && status !== null
+    && typeof status.promptTokens === 'number' && typeof status.contextWindow === 'number'
+    && status.contextWindow > 0
+    ? status.promptTokens / status.contextWindow
+    : null
+  const head = used === null
+    ? [createElement('span', { key: 'unknown', className: 'dsh-panel-headline' }, t('panel.unknown'))]
+    : [
+        createElement('span', { key: 'before', className: 'dsh-panel-headline' }, t('panel.usedBefore')),
+        createElement('span', { key: 'percent', className: 'dsh-panel-percent' },
+          `${Math.min(100, Math.round(used * 100))}%`),
+        createElement('span', { key: 'after', className: 'dsh-panel-headline' }, t('panel.usedAfter')),
+        createElement('span', { key: 'figures', className: 'dsh-panel-figures' },
+          `~${formatTokens(status.promptTokens) ?? '—'} / ${formatTokens(status.contextWindow) ?? '—'}`),
+      ]
+  // The rungs this session actually has. A session set to standard compaction
+  // never crosses this plugin's three points — its backend summarises first —
+  // so its bar has one boundary, at that backend's own threshold, rather than
+  // three the window will never reach.
+  const compacting = status !== undefined && status !== null && status.stage === 'compacting'
+  const ladder = status === undefined || status === null || status.points === undefined
+    ? []
+    : compacting
+      ? [{ key: 'compact', at: status.points.compact, zone: 'past' }]
+      : [
+          { key: 'notify', at: status.points.notify, zone: 'notified' },
+          { key: 'warn', at: status.points.warn, zone: 'lastChance' },
+          { key: 'rollover', at: status.points.rollover, zone: 'past' },
+        ]
+  // A point that lands on the one after it opens no band of its own. The engine
+  // reads that as a shorter ladder rather than a broken one, so the bar drops
+  // the stage instead of drawing two ticks in the same pixel — and the band the
+  // dropped point would have opened is absorbed by the one before it.
+  const rungs = ladder.filter((rung, index) => index === ladder.length - 1 || rung.at < ladder[index + 1].at)
+  /** One ratio as a percentage of the bar, clamped to it. */
+  const at = ratio => Math.min(100, Math.max(0, ratio * 100))
+  const zones = rungs.map((rung, index) => createElement('span', {
+    key: `zone-${rung.key}`,
+    className: 'dsh-bar-zone',
+    'data-zone': rung.zone,
+    style: { left: `${at(rung.at)}%`, width: `${at(index + 1 < rungs.length ? rungs[index + 1].at : 1) - at(rung.at)}%` },
+  }))
+  const marks = rungs.map(rung => createElement('span', {
+    key: `mark-${rung.key}`,
+    className: 'dsh-bar-mark',
+    'data-mark': rung.key,
+    style: { left: `${at(rung.at)}%` },
+  }))
+  // The key names each mark so a position never has to be read off the bar's
+  // own geometry. The rung the window is heading for is the highlighted one;
+  // the ones already behind it are context.
+  const nextRung = rungs.find(rung => used === null || used < rung.at)
+  const keys = rungs.map(rung => createElement('span', {
+    key: `key-${rung.key}`,
+    className: 'dsh-bar-key',
+    'data-point': rung.key,
+    ...(rung === nextRung ? { 'data-next': '' } : {}),
+    ...(used !== null && used >= rung.at ? { 'data-passed': '' } : {}),
+  },
+  createElement('span', { className: 'dsh-key-dot', 'aria-hidden': true }),
+  `${t(`panel.point.${rung.key}`)} ${Math.round(rung.at * 100)}%`,
+  ))
+  return overlay(createElement('div', {
+    className: 'dsh-context-rollover-panel',
+    role: 'dialog',
+    'aria-label': t('panel.switch'),
+    style: placement,
+  },
+  createElement('div', { className: 'dsh-panel-head' }, ...head),
+  createElement('div', { className: 'dsh-bar' },
+    ...zones,
+    createElement('span', {
+      className: 'dsh-bar-used',
+      style: { width: `${used === null ? 0 : at(used)}%` },
+    }),
+    ...marks,
+  ),
+  keys.length === 0 ? null : createElement('p', { className: 'dsh-bar-keys' }, ...keys),
+  createElement('div', {
+    className: 'dsh-stage',
+    'data-stage': status === undefined || status === null ? 'unknown' : status.stage,
+  },
+  createElement('span', { className: 'dsh-stage-dot', 'aria-hidden': true }),
+  createElement('span', { className: 'dsh-stage-text' }, sentence),
+  ),
+  createElement('div', { className: 'dsh-switch-row' },
+    createElement('span', { className: 'dsh-switch-label' }, t('panel.switch')),
+    createElement('button', {
+      type: 'button',
+      className: 'dsh-switch',
+      role: 'switch',
+      'aria-checked': rollover,
+      'aria-label': t('panel.switch'),
+      disabled: pending,
+      onClick: onToggle,
+    }, createElement('span', { className: 'dsh-thumb' })),
+  ),
+  createElement('p', { className: 'dsh-panel-hint' }, pending ? t('panel.pending') : t('panel.switchHint')),
+  error === undefined ? null : createElement('p', { className: 'dsh-warn' }, error),
+  ))
+}
+
+/**
+ * Whether one node contains another, without assuming a DOM is present.
+ * @param node - the candidate container.
+ * @param target - the event target.
+ * @returns true when `target` is `node` or sits inside it.
+ */
+function contains(node, target) {
+  if (node === null || node === undefined || target === null || target === undefined) return false
+  if (node === target) return true
+  if (typeof node.contains !== 'function') return false
+  return node.contains(target)
 }
 
 
@@ -1010,16 +1748,21 @@ function ladderPanel(t, snapshot, scope, guardError, write) {
 }
 
 /**
- * The Plugin configuration card for this namespace.
+ * Everything the configuration form does, independent of the shell it is drawn
+ * in.
  *
- * Laid out like the section's own cards — a header that discloses the body —
- * with the ladder and the remaining policy settings on the surface and the
+ * The ladder and the remaining policy settings sit on the surface with the
  * guardrails behind an Advanced disclosure. Writes settle per field rather than
  * through a staged save, because every value here is a live threshold.
+ *
+ * A hook rather than a component because the form now has two shells — the
+ * Settings card older hosts mount, and the bundle's page in the sidebar's
+ * Plugins tab — and they must not drift apart. Both call this once and hand the
+ * result to {@link rolloverPanel}; only the chrome around the panel differs.
  * @param props - settings-scope binding plus the shell's locale seat.
- * @returns the card element tree.
+ * @returns the form's state, its translators, and its write controller.
  */
-function RolloverSettingsCard(props) {
+function useRolloverSettings(props) {
   const t = (key, values) => translate(props.t, key, values)
   const scope = props.scope
   ensureStyles()
@@ -1162,6 +1905,94 @@ function RolloverSettingsCard(props) {
       .some(field => fieldOverridden(settledSnapshot(), field.key))
     track(scope.mutate(ops), cleared)
   }
+  return {
+    t,
+    scope,
+    snapshot,
+    report,
+    error,
+    refusal,
+    write,
+    guardError,
+    renderFields,
+    overriddenCount,
+    resetAll,
+    title,
+    open,
+    setOpen,
+    advanced,
+    setAdvanced,
+    preempt: preemptOf(snapshot),
+    currentThreshold,
+  }
+}
+
+/** Whether interception is on, from a scope snapshot. */
+function preemptOf(snapshot) {
+  return fieldValue(snapshot, 'preempt')
+}
+
+/**
+ * The form itself, without the chrome: the reset-all row, the ladder, the
+ * surface fields, the backend line, a refusal or a failure, the Advanced
+ * disclosure, and the read-only notice.
+ *
+ * Both shells draw this exact tree, so a control added here reaches the
+ * Settings card and the Plugins page together.
+ * @param model - what {@link useRolloverSettings} returned.
+ * @returns the body element.
+ */
+function rolloverPanel(model) {
+  const {
+    t, snapshot, scope, guardError, write, renderFields, overriddenCount, resetAll,
+    advanced, setAdvanced, refusal, error, report, currentThreshold, preempt,
+  } = model
+  return createElement('div', { className: 'dsh-body' },
+    overriddenCount > 0 && snapshot.writable !== false
+      ? createElement('div', { className: 'dsh-reset-all-row' },
+          createElement('button', {
+            type: 'button',
+            className: 'dsh-reset dsh-reset-deployment',
+            onClick: resetAll,
+          }, t('card.resetAll')),
+        )
+      : null,
+    ladderPanel(t, snapshot, scope, guardError, write),
+    createElement('div', { className: 'dsh-grid' }, ...renderFields(SURFACE_FIELDS)),
+    systemPanel(t, report, currentThreshold, preempt),
+    refusal === undefined ? null : createElement('p', { className: 'dsh-warn' }, refusal),
+    createElement('button', {
+      type: 'button',
+      className: 'dsh-advanced',
+      'aria-expanded': advanced,
+      onClick: () => { setAdvanced(!advanced) },
+    }, `${advanced ? '▾' : '▸'} ${t('card.advanced')}`),
+    advanced
+      ? createElement('div', null,
+          createElement('p', { className: 'dsh-hint' }, t('card.advanced.hint')),
+          createElement('div', { className: 'dsh-grid' }, ...renderFields(ADVANCED_FIELDS)),
+        )
+      : null,
+    snapshot.writable === false
+      ? createElement('p', { className: 'dsh-hint' }, t('card.unavailable'))
+      : null,
+    error === undefined ? null : createElement('p', { className: 'dsh-warn' }, error),
+  )
+}
+
+/**
+ * The Settings > Plugins card shell: a list item whose header discloses the
+ * form, matching the section's own plugin cards.
+ *
+ * Mounted only on hosts that still declare `settings.plugin.item`; on
+ * 0.1.6-alpha.2 and later nothing draws it and the Plugins page shell below is
+ * the only configuration surface.
+ * @param props - settings-scope binding plus the shell's locale seat.
+ * @returns the card element tree.
+ */
+function RolloverSettingsCard(props) {
+  const model = useRolloverSettings(props)
+  const { t, title, open, setOpen } = model
   return createElement('li', {
     className: open ? 'dsh-context-rollover-card dsh-open' : 'dsh-context-rollover-card',
   },
@@ -1188,45 +2019,25 @@ function RolloverSettingsCard(props) {
       strokeLinecap: 'round',
       strokeLinejoin: 'round',
     }, createElement('path', { d: 'M3.5 5.25 7 8.75l3.5-3.5' }))),
-    open
-      ? createElement('div', { className: 'dsh-body' },
-          overriddenCount > 0 && snapshot.writable !== false
-            ? createElement('div', { className: 'dsh-reset-all-row' },
-                createElement('button', {
-                  type: 'button',
-                  className: 'dsh-reset dsh-reset-deployment',
-                  onClick: resetAll,
-                }, t('card.resetAll')),
-              )
-            : null,
-          ladderPanel(t, snapshot, scope, guardError, write),
-          createElement('div', { className: 'dsh-grid' }, ...renderFields(SURFACE_FIELDS)),
-          systemPanel(t, report, currentThreshold, preemptOf(snapshot)),
-          refusal === undefined ? null : createElement('p', { className: 'dsh-warn' }, refusal),
-          createElement('button', {
-            type: 'button',
-            className: 'dsh-advanced',
-            'aria-expanded': advanced,
-            onClick: () => { setAdvanced(!advanced) },
-          }, `${advanced ? '▾' : '▸'} ${t('card.advanced')}`),
-          advanced
-            ? createElement('div', null,
-                createElement('p', { className: 'dsh-hint' }, t('card.advanced.hint')),
-                createElement('div', { className: 'dsh-grid' }, ...renderFields(ADVANCED_FIELDS)),
-              )
-            : null,
-          snapshot.writable === false
-            ? createElement('p', { className: 'dsh-hint' }, t('card.unavailable'))
-            : null,
-          error === undefined ? null : createElement('p', { className: 'dsh-warn' }, error),
-        )
-      : null,
+    open ? rolloverPanel(model) : null,
   )
 }
 
-/** Whether interception is on, from a scope snapshot. */
-function preemptOf(snapshot) {
-  return fieldValue(snapshot, 'preempt')
+/**
+ * The Plugins page shell: the bundle's own configuration, drawn bare.
+ *
+ * The page owns the title, the icon, the crumb, and the one-liner, and it asks
+ * every entry for two views. `summary` is that one-liner and never the form;
+ * `page` is the form, already disclosed and with no chrome of its own, because
+ * the page's section is the frame. The page only ever asks for `page` here, but
+ * the entry honors the contract it was registered under.
+ * @param props - the view the page asks for, the scope binding, and the locale seat.
+ * @returns the one-liner, or the form element.
+ */
+function RolloverBundleConfig(props) {
+  const model = useRolloverSettings(props)
+  if (props.view === 'summary') return model.t('card.intro')
+  return createElement('div', { className: 'dsh-context-rollover-card dsh-page' }, rolloverPanel(model))
 }
 
 /**
@@ -1254,14 +2065,32 @@ function apply(ctx) {
     if (settingsScope === null || settingsScope === undefined || typeof settingsScope.bind !== 'function') return
     const scope = settingsScope.bind({ namespace: SETTINGS_NS })
     const scopedSlots = scopeCtx.get('slots') ?? slots
+    // Both surfaces are registered, and each waits for its own declaration.
+    // `inject` installs the effect when the slot is declared and cancels it when
+    // the declaration collapses, so on any one host exactly the slot that host
+    // declares lights up: the Settings card on hosts up to 0.1.6-alpha.1, the
+    // bundle's page in the sidebar's Plugins tab from 0.1.6-alpha.2 on. The
+    // other registration stays pending and costs nothing.
     scopeCtx.effect(
-      () => scopedSlots.inject(SETTINGS_SLOT, () => scopedSlots.register({
-        name: SETTINGS_SLOT,
+      () => scopedSlots.inject(LEGACY_SETTINGS_SLOT, () => scopedSlots.register({
+        name: LEGACY_SETTINGS_SLOT,
         key: SETTINGS_NS,
         locale: LOCALE_NS,
         inject: () => ({ scope }),
       }, RolloverSettingsCard)),
       'context-rollover settings card',
+    )
+    // The key is the bundle's package name, which is what the Plugins page
+    // dispatches when it opens this bundle: `dsh-context-rollover`, the name the
+    // profile installs and the name `cordis.patch.yml` mounts.
+    scopeCtx.effect(
+      () => scopedSlots.inject(BUNDLE_CONFIG_SLOT, () => scopedSlots.register({
+        name: BUNDLE_CONFIG_SLOT,
+        key: BUNDLE_NAME,
+        locale: LOCALE_NS,
+        inject: () => ({ scope }),
+      }, RolloverBundleConfig)),
+      'context-rollover bundle configuration',
     )
   })
   ctx.effect(
@@ -1272,8 +2101,10 @@ function apply(ctx) {
       locale: LOCALE_NS,
       label: 'Context Rollover',
       // The session id is bound per session, so the button never looks it up;
-      // `remote.commands` is the same executor the composer uses.
+      // `remote.commands` is the same executor the composer uses, and the id is
+      // what the control reads its own countdown with.
       inject: sessionId => ({
+        sessionId,
         // Resolves with the outcome rather than firing and forgetting: the
         // gateway reports ordinary refusals and an offline carrier as a
         // fulfilled `{ ok: false }`, so only the result says whether anything

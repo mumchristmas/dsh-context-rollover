@@ -16,10 +16,20 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const buildScript = join(repoRoot, 'scripts', 'build-client.mjs')
+
+/**
+ * Whatever `getComputedStyle` the host running these tests has — nothing, in
+ * Node — so a dock fixture installed for one test cannot outlive it.
+ */
+const nativeComputedStyle = (globalThis as { getComputedStyle?: unknown }).getComputedStyle
+
+afterEach(() => {
+  ;(globalThis as { getComputedStyle?: unknown }).getComputedStyle = nativeComputedStyle
+})
 
 /** One contribution captured from a fake slots service. */
 interface Contribution {
@@ -29,6 +39,7 @@ interface Contribution {
     key?: string
     order?: number
     label?: string
+    locale?: string
     inject?: (sessionId: string) => unknown
   }
   readonly component: (props: Record<string, unknown>) => unknown
@@ -62,8 +73,81 @@ interface FakeScope {
   reject: { value: boolean }
 }
 
+/** One fake element carrying the computed style and geometry the walk reads. */
+interface DockElement {
+  style: { display: string, flexDirection?: string }
+  parentElement: DockElement | null
+  firstElementChild: DockElement | null
+  lastElementChild: DockElement | null
+  children: DockElement[]
+  getBoundingClientRect(): { right: number, width: number }
+}
+
+/** A fake element with the given computed display and box, empty to start. */
+function dockElement(
+  style: { display: string, flexDirection?: string },
+  box: { right: number, width: number } = { right: 0, width: 0 },
+): DockElement {
+  return {
+    style,
+    parentElement: null,
+    firstElementChild: null,
+    lastElementChild: null,
+    children: [],
+    getBoundingClientRect: () => ({ right: box.right, width: box.width }),
+  }
+}
+
+/**
+ * What the mode button's refs hold when no dock fixture is in play.
+ *
+ * `firstElementChild` being null is the point: the alignment effect reads the
+ * button from it and gives up, so a test that is not about the dock never has
+ * to describe one — while the overlay placement still has a rect to measure.
+ */
+function inertRefTarget(): {
+  firstElementChild: null
+  getBoundingClientRect(): { left: number, top: number, right: number, bottom: number, width: number, height: number }
+} {
+  return {
+    firstElementChild: null,
+    getBoundingClientRect: () => ({ left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 }),
+  }
+}
+
+/**
+ * The composer as one host line lays it out.
+ *
+ * Both lines put a `display: contents` slot outlet between this entry and the
+ * element that actually places it, so the walk has to step over one. What
+ * differs is that element: the composer root, a column flex box, up to
+ * 0.1.6-alpha.1 — which marks its stats row with `data-composer-stats` and needs
+ * the measured overlay — and the stats row itself, a centered row flex box,
+ * from 0.1.6-alpha.2, where the entry is simply one of its items.
+ * @param container - the computed style of the element that places the entry.
+ * @param geometry - the right edges the overlay measurement reads.
+ * @param statsRow - whether the older line's `[data-composer-stats]` row exists.
+ * @returns the entry element plus the row the document lookup must answer with.
+ */
+function fakeComposer(
+  container: { display: string, flexDirection?: string },
+  geometry: { entryRight: number, buttonWidth: number, anchorRight: number },
+  statsRow: boolean,
+): { entry: DockElement, row: DockElement | null } {
+  const button = dockElement({ display: 'inline-flex' }, { right: geometry.entryRight, width: geometry.buttonWidth })
+  const entry = dockElement({ display: 'flex' }, { right: geometry.entryRight, width: 0 })
+  entry.firstElementChild = button
+  const outlet = dockElement({ display: 'contents' })
+  entry.parentElement = outlet
+  outlet.parentElement = dockElement(container)
+  const row = statsRow
+    ? dockElement({ display: 'flex', flexDirection: 'row' }, { right: geometry.anchorRight, width: 0 })
+    : null
+  return { entry, row }
+}
+
 /** Load the built artifact through the shell's loader contract. */
-function loadClient(): {
+function loadClient(dock?: { entry: DockElement, row: DockElement | null }): {
   id: string
   exports: { apply?: (ctx: unknown) => void, inject?: readonly string[], name?: string }
   contributions: Contribution[]
@@ -74,6 +158,10 @@ function loadClient(): {
   scope: FakeScope
   boundNamespaces: string[]
   backendRequests: string[]
+  statusRequests: string[]
+  statusPayload: { value: unknown }
+  /** The fake document, so a test can press a key or a pointer at it. */
+  document: { dispatch(type: string, event: Record<string, unknown>): void }
   render: (component: (props: Record<string, unknown>) => unknown, props: Record<string, unknown>) => unknown
 } {
   execFileSync(process.execPath, [buildScript], { cwd: repoRoot })
@@ -84,15 +172,36 @@ function loadClient(): {
   /** What `remote.commands.execute` resolves with. */
   const commandResult: { value: unknown } = { value: {} }
   const backendRequests: string[] = []
+  /** Every status poll, in order, so a test can read the session it named. */
+  const statusRequests: string[] = []
+  /**
+   * What the status route answers. The default reading is one already inside
+   * the rollover band, which is the state the control has the most to say
+   * about; a test can replace it with `null` for a host that has no such
+   * session, or with any other stage.
+   */
+  const statusPayload: { value: unknown } = {
+    value: {
+      mode: 'rollover',
+      stage: 'rollover',
+      promptTokens: 770000,
+      contextWindow: 1000000,
+      tokensToNext: 20000,
+      points: { notify: 0.72, warn: 0.76, rollover: 0.79, compact: 0.8 },
+    },
+  }
   let effects = 0
 
   const modules: Record<string, unknown> = {
     react: {
       createElement: (type: unknown, props: unknown, ...children: unknown[]) => ({ type, props: props ?? {}, children }),
-      // The button measures itself in a layout effect; with no ref attached in
-      // this JSX-free stub the effect returns early, which is what the render
-      // assertions below rely on.
-      useRef: () => ({ current: null }),
+      // The button measures itself in a layout effect and anchors its overlays
+      // to itself through a second ref. A dock fixture supplies a composer to
+      // walk; without one the refs attach to an element that has no button
+      // inside it, so the alignment effect returns before it measures anything.
+      useRef: (initial: unknown) => ({
+        current: initial === null ? (dock === undefined ? inertRefTarget() : dock.entry) : null,
+      }),
       useState: (initial: unknown) => {
         const index = hookCursor++
         if (hookSlots.length <= index) {
@@ -204,7 +313,17 @@ function loadClient(): {
 
   const previousFetch = (globalThis as { fetch?: unknown }).fetch
   ;(globalThis as { fetch?: unknown }).fetch = (url: string) => {
-    backendRequests.push(String(url))
+    const href = String(url)
+    // One stub, two routes: the card reads the backend report and the composer
+    // control polls the session reading, and both go through `fetch`.
+    if (href.includes('/context-rollover/status')) {
+      statusRequests.push(href)
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve(statusPayload.value),
+      })
+    }
+    backendRequests.push(href)
     return Promise.resolve({
       ok: true,
       json: () => Promise.resolve({
@@ -229,12 +348,34 @@ function loadClient(): {
       loaded = { id, exports: assertExports(factory(requireModule)) }
     },
   }
+  // The alignment walk asks the browser for a computed style; outside a browser
+  // the answer has to come from the fake composer's own elements. Only a fixture
+  // installs this, and the suite's `afterEach` takes it back off.
+  if (dock !== undefined) {
+    ;(globalThis as { getComputedStyle?: unknown }).getComputedStyle =
+      (element: DockElement) => element.style
+  }
+  // The alignment effect re-measures on resize, so the fake window carries the
+  // listener pair a browser window has. Nothing fires them; the tests drive the
+  // measurement by rendering, which is when a layout effect runs.
+  const resizeListeners: Array<() => void> = []
+  const fakeWindow = {
+    __ModuleLoader__: loader,
+    addEventListener: (type: string, listener: () => void) => {
+      if (type === 'resize') resizeListeners.push(listener)
+    },
+    removeEventListener: (_type: string, listener: () => void) => {
+      const index = resizeListeners.indexOf(listener)
+      if (index !== -1) resizeListeners.splice(index, 1)
+    },
+  }
   // The artifact is a classic script: `window`, `require`, and (for its own
   // stylesheet) `document` are the only ambient names it may use.
+  const document = fakeDocument(dock === undefined ? true : dock.row)
   new Function('window', 'require', 'document', artifact)(
-    { __ModuleLoader__: loader },
+    fakeWindow,
     requireModule,
-    fakeDocument(true),
+    document,
   )
   if (loaded === undefined) throw new Error('client artifact never called __ModuleLoader__.load')
   loaded.exports.apply?.(ctx)
@@ -249,6 +390,9 @@ function loadClient(): {
     scope,
     boundNamespaces,
     backendRequests,
+    statusRequests,
+    statusPayload,
+    document: document as { dispatch(type: string, event: Record<string, unknown>): void },
     render,
   }
 }
@@ -326,20 +470,46 @@ function fakeScope(): FakeScope {
 /**
  * A minimal document: enough for the injected stylesheet and for the stats-row
  * lookup the alignment depends on, with a JSX-free DOM.
- * @param statsRow - whether a `[data-composer-stats]` row is present.
+ * @param statsRow - what the `[data-composer-stats]` lookup answers. `true` is
+ *   the placeholder for a test that only needs the row to exist and never
+ *   measures it; an alignment fixture hands over its fake row element instead,
+ *   and `null` is a host that draws no stats row at all.
  */
-function fakeDocument(statsRow: boolean): unknown {
+function fakeDocument(statsRow: unknown): unknown {
   const appended: Array<{ dataset: Record<string, unknown>, textContent: string }> = []
+  const listeners = new Map<string, Array<(event: Record<string, unknown>) => void>>()
   const document = {
     documentElement: { lang: 'zh-CN' },
     head: { appendChild: (tag: { dataset: Record<string, unknown>, textContent: string }) => appended.push(tag) },
     createElement: () => ({ dataset: {} as Record<string, unknown>, textContent: '' }),
     querySelector: (selector: string) => {
-      if (selector === '[data-composer-stats]') return statsRow ? {} : null
+      if (selector === '[data-composer-stats]') return statsRow === true ? {} : statsRow
       return appended.some(tag => selector.includes(String(tag.dataset['pluginCss']))) ? appended[0] : null
+    },
+    // The control closes its panel on a document-level press and on Escape, so
+    // the fake document carries the listener pair a real one has, and a test
+    // can press either key.
+    addEventListener: (type: string, listener: (event: Record<string, unknown>) => void) => {
+      const bucket = listeners.get(type)
+      if (bucket === undefined) listeners.set(type, [listener])
+      else bucket.push(listener)
+    },
+    removeEventListener: (type: string, listener: (event: Record<string, unknown>) => void) => {
+      const bucket = listeners.get(type)
+      if (bucket === undefined) return
+      const index = bucket.indexOf(listener)
+      if (index !== -1) bucket.splice(index, 1)
     },
   }
   Object.defineProperty(document, 'appended', { value: appended })
+  Object.defineProperty(document, 'dispatch', {
+    value: (type: string, event: Record<string, unknown>) => {
+      for (const listener of [...(listeners.get(type) ?? [])]) listener(event)
+    },
+  })
+  Object.defineProperty(document, 'listenerCount', {
+    value: (type: string) => (listeners.get(type) ?? []).length,
+  })
   return document
 }
 
@@ -995,6 +1165,169 @@ describe('settings card', () => {
   })
 })
 
+describe('plugins page configuration', () => {
+  /**
+   * The bundle-configuration contribution the sidebar's Plugins tab dispatches.
+   *
+   * 0.1.6-alpha.2 removed the Settings surface and moved a plugin's
+   * configuration onto its own page in the Plugins tab, keyed by the bundle's
+   * package name. Without this registration the page lists the bundle and opens
+   * it to an empty configuration section — the state this covers.
+   */
+  function bundleConfig(loaded: ReturnType<typeof loadClient>): Contribution {
+    const contribution = loaded.contributions
+      .find(candidate => candidate.options.name === 'plugins.bundle.config')
+    if (contribution === undefined) throw new Error('the form did not register into the bundle configuration slot')
+    return contribution
+  }
+
+  it('registers under the bundle package name the page dispatches', () => {
+    const loaded = loadClient()
+    const card = bundleConfig(loaded)
+    expect(card.options.key).toBe('dsh-context-rollover')
+    expect(card.options.locale).toBe('context-rollover')
+    // One bound scope serves both surfaces, so a value written from either is
+    // the same value: binding twice would give the two forms separate snapshots.
+    expect(loaded.boundNamespaces).toEqual(['context-rollover'])
+  })
+
+  it('keeps the legacy Settings registration beside the new one', () => {
+    const loaded = loadClient()
+    const names = loaded.contributions.map(candidate => candidate.options.name)
+    // Both are registered and each waits for its own declaration, so hosts
+    // before 0.1.6-alpha.2 still draw the card while later hosts draw the page.
+    expect(names).toContain('settings.plugin.item')
+    expect(names).toContain('plugins.bundle.config')
+    const legacy = loaded.contributions.find(candidate => candidate.options.name === 'settings.plugin.item')
+    expect(legacy?.options.key).toBe('context-rollover')
+  })
+
+  it('answers summary with the one-liner and page with the disclosed form', () => {
+    const loaded = loadClient()
+    const card = bundleConfig(loaded)
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope, view: 'summary' }
+    // `summary` is the one-liner the page prints under the title, never a form.
+    expect(loaded.render(card.component, props)).toBe('T:card.intro')
+
+    const tree = loaded.render(card.component, { ...props, view: 'page' })
+    const elements = elementsOf(tree)
+    // The page draws the title, the icon, and the crumb, so this entry draws the
+    // form bare: a plain element rather than the Settings card's list item, and
+    // no disclosure header, because an open page has nothing left to disclose.
+    expect((tree as { type: unknown }).type).toBe('div')
+    expect(elements.some(element => element.type === 'li')).toBe(false)
+    expect(elements.some(element => element.props['className'] === 'dsh-head')).toBe(false)
+    expect(elements.some(element =>
+      String(element.props['className'] ?? '').includes('dsh-page'))).toBe(true)
+    // The same five surface fields the Settings card shows, already on screen.
+    const inputs = elements.filter(element => element.type === 'input')
+    expect(inputs.map(input => input.props['aria-label'])).toEqual([
+      'T:card.reminderThresholdRatio',
+      'T:card.lastChanceRatio',
+      'T:card.thresholdRatio',
+      'T:card.retainTokens',
+      'T:card.preempt',
+    ])
+    expect(inputs[2]?.props['value']).toBe('90')
+  })
+
+  it('writes through the same scope from the Plugins page', () => {
+    const loaded = loadClient()
+    const card = bundleConfig(loaded)
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope, view: 'page' }
+    // The keystroke and the confirming blur are separate renders, exactly as in
+    // the Settings card: the page changes the chrome, not the write path.
+    const field = (): ReturnType<typeof elementsOf>[number] | undefined =>
+      elementsOf(loaded.render(card.component, props))
+        .find(element => element.props['aria-label'] === 'T:card.thresholdRatio')
+    ;(field()?.props['onChange'] as (event: unknown) => void)({ target: { value: '65' } })
+    ;(field()?.props['onBlur'] as () => void)()
+    expect(loaded.scope.calls).toEqual([['set', 'thresholdRatio', 0.65]])
+  })
+
+  it('carries the Advanced fields behind the disclosure on the page too', () => {
+    const loaded = loadClient()
+    const card = bundleConfig(loaded)
+    const props = { t: (key: string) => `T:${key}`, scope: loaded.scope, view: 'page' }
+    const advanced = elementsOf(loaded.render(card.component, props))
+      .find(element => element.props['className'] === 'dsh-advanced')
+    expect(advanced?.type).toBe('button')
+    ;(advanced?.props['onClick'] as () => void)()
+    const labels = elementsOf(loaded.render(card.component, props))
+      .filter(element => element.type === 'input')
+      .map(input => input.props['aria-label'])
+    expect(labels).toContain('T:card.notesEnabled')
+    expect(labels).toContain('T:card.handoffMaxChars')
+  })
+})
+
+describe('composer dock alignment', () => {
+  /**
+   * Render the button twice: the alignment effect runs inside the render it
+   * belongs to, exactly as a layout effect does before paint, so the state it
+   * sets is what the next render sees.
+   */
+  function aligned(loaded: ReturnType<typeof loadClient>): {
+    className: string
+    style: Record<string, unknown>
+  } {
+    const contribution = dockContribution(loaded)
+    const setMode = contribution.options.inject?.('session-1') as Record<string, unknown>
+    const props = { useProjection: () => 'rollover', ...setMode }
+    loaded.render(contribution.component, props)
+    const tree = loaded.render(contribution.component, props) as {
+      props: { className: string, style: Record<string, unknown> }
+    }
+    return { className: tree.props.className, style: tree.props.style }
+  }
+
+  it('joins the row the 0.1.6-alpha.2 dock lays out, and measures nothing', () => {
+    // The stats row is the entry's container, so the row's own gap places it.
+    const loaded = loadClient(fakeComposer(
+      { display: 'flex', flexDirection: 'row' },
+      { entryRight: 975, buttonWidth: 32, anchorRight: 1051 },
+      true,
+    ))
+    const { className, style } = aligned(loaded)
+    expect(className).toBe('dsh-context-rollover-mode dsh-in-dock')
+    // Nothing to add: a measured overlay offset here is what pushed the button
+    // into the middle of the band, ahead of the usage donut that follows it.
+    expect(style).toEqual({})
+  })
+
+  it('still overlays the column dock, one pill-gap past the last pill', () => {
+    // The composer root is the container, and the stats row marks itself: the
+    // entry spans the row's box (right edge 1035), the button is 32 wide, and
+    // the last pill ends at 959. The padding therefore works out to
+    // 1035 − 959 − 12 − 32 = 32, which lands the button at 971..1003 — one
+    // 12px pill-gap after the pill, which is the whole point of the offset.
+    const loaded = loadClient(fakeComposer(
+      { display: 'flex', flexDirection: 'column' },
+      { entryRight: 1035, buttonWidth: 32, anchorRight: 959 },
+      true,
+    ))
+    const { className, style } = aligned(loaded)
+    expect(className).toBe('dsh-context-rollover-mode')
+    expect(style).toEqual({
+      paddingRight: '32px',
+      marginTop: 'calc(-1 * (22px + var(--dsh-content-font-delta-secondary, 0px)))',
+    })
+  })
+
+  it('falls back to a plain entry when a column dock draws no stats row', () => {
+    // Neither shape: no row to align to, so the entry keeps its own box rather
+    // than being pulled up over content that is not there.
+    const loaded = loadClient(fakeComposer(
+      { display: 'flex', flexDirection: 'column' },
+      { entryRight: 1035, buttonWidth: 32, anchorRight: 0 },
+      false,
+    ))
+    const { className, style } = aligned(loaded)
+    expect(className).toBe('dsh-context-rollover-mode')
+    expect(style).toEqual({})
+  })
+})
+
 describe('browser half', () => {
   it('declares the client entry the shell scans for', () => {
     const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
@@ -1002,11 +1335,16 @@ describe('browser half', () => {
       files: string[]
       dsh: { client?: { platform?: string, inject?: string[] } }
     }
-    // The client edge the shell keys the card's slot package on, per the
-    // settings-card cookbook.
+    // The client edges the shell composes the module graph from: the Settings
+    // section that declares the legacy card's slot, and the Plugins page that
+    // declares the one 0.1.6-alpha.2 moved configuration onto. A host missing
+    // either simply has no row to arrive, which the boot graph tolerates.
     expect(manifest.dsh.client).toEqual({
       platform: 'web',
-      inject: ['@deepseek-ai/dsh-client-ui-settings-plugins'],
+      inject: [
+        '@deepseek-ai/dsh-client-ui-settings-plugins',
+        '@deepseek-ai/dsh-client-ui-plugin-manager',
+      ],
     })
     expect(manifest.exports['./client']).toEqual({ default: './lib/client.js' })
     expect(manifest.files).toContain('lib')
@@ -1054,8 +1392,8 @@ describe('browser half', () => {
     expect(artifact).toContain('padding: 1px 8px')
     expect(artifact).toContain('border-radius: 24px')
     expect(artifact).toContain('svg { width: 16px; height: 16px; flex: none; }')
-    // Mirrors the stats row's centered box, then measures the last native pill
-    // so this one joins the group one pill-gap later.
+    // The older column dock: mirror the stats row's centered box, then measure
+    // the last native pill so this one joins the group one pill-gap later.
     expect(artifact).toContain('max-width: var(--dsh-chat-content-width)')
     expect(artifact).toContain('margin: 0 auto')
     expect(artifact).toContain('justify-content: flex-end')
@@ -1063,6 +1401,16 @@ describe('browser half', () => {
     expect(artifact).toContain('ResizeObserver')
     expect(artifact).toContain('lastElementChild')
     expect(artifact).toContain('calc(-1 * (22px + var(--dsh-content-font-delta-secondary, 0px)))')
+    // The 0.1.6-alpha.2 row dock: the entry is one flex item of the stats row,
+    // so it shrinks to the button and takes no margin for the row to distribute.
+    expect(artifact).toContain('.dsh-context-rollover-mode.dsh-in-dock {')
+    expect(artifact).toContain('width: auto;')
+    expect(artifact).toContain('margin: 0;')
+    expect(artifact).toContain('justify-content: flex-start;')
+    // The row/column decision reads the container past the `display: contents`
+    // slot outlet, because that is the element whose flex rules place the entry.
+    expect(artifact).toContain("display === 'contents'")
+    expect(artifact).toContain("flexDirection === 'row' ? 'row' : 'column'")
     // The entry spans the stats band to position one pill: its empty area must
     // not swallow the native pills' clicks, so it stays click-through.
     expect(artifact).toContain('.dsh-context-rollover-mode { pointer-events: none; }')
@@ -1089,13 +1437,17 @@ describe('browser half', () => {
 
     const rollover = buttonFor(contribution, 'rollover')
     expect(rollover.button.props['data-context-rollover-mode']).toBe('rollover')
-    expect(rollover.button.props['aria-pressed']).toBe(true)
-    expect(String(rollover.button.props['title'])).toContain('滚动归档')
+    // The click belongs to the numbers now, not to the mode: the trigger opens
+    // the panel, and nothing about it says "pressed".
+    expect(rollover.button.props['aria-haspopup']).toBe('dialog')
+    expect(rollover.button.props['aria-expanded']).toBe(false)
+    expect(rollover.button.props['aria-pressed']).toBeUndefined()
+    expect(rollover.button.props['title']).toBeUndefined()
+    expect(String(rollover.button.props['aria-label'])).toContain('滚动归档')
 
     const compact = buttonFor(contribution, 'compact')
     expect(compact.button.props['data-context-rollover-mode']).toBe('compact')
-    expect(compact.button.props['aria-pressed']).toBe(false)
-    expect(String(compact.button.props['title'])).toContain('标准压缩')
+    expect(String(compact.button.props['aria-label'])).toContain('标准压缩')
 
     // The two modes must not look identical: different icon paths.
     const paths = (icon: { children?: Array<{ props?: { d?: string } }> }): string =>
@@ -1118,26 +1470,71 @@ describe('browser half', () => {
     const zhTable = registration?.dicts.zh ?? {}
     const t = (key: string): string => zhTable[key] ?? `MISSING:${key}`
     const zh = buttonFor(contribution, 'rollover', 'session-1', { t })
-    expect(zh.button.props['title']).toContain('滚动归档')
-    expect(zh.button.props['aria-label']).toBe('上下文管理模式：滚动归档')
-    const zhCompact = buttonFor(contribution, 'compact', 'session-1', { t })
-    expect(zhCompact.button.props['aria-label']).toBe('上下文管理模式：标准压缩')
+    expect(String(zh.button.props['aria-label'])).toContain('滚动归档')
+    // Nothing on any surface may fall back to a raw key.
+    expect(JSON.stringify(loaded.render(contribution.component, {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+      t,
+    }))).not.toContain('MISSING')
 
     // Without a `t` the built-in fallback still answers (document language).
     const fallback = buttonFor(contribution, 'rollover')
-    expect(String(fallback.button.props['title'])).not.toContain('MISSING')
+    expect(String(fallback.button.props['aria-label'])).not.toContain('MISSING')
   })
 
-  it('writes the other mode through /rollover when clicked', () => {
+  /**
+   * Open the panel the way a reader does — one click on the trigger — and hand
+   * back its switch plus a re-render, so a test can drive the mode from the one
+   * control that changes it.
+   *
+   * The extra render is the placement effect's: it runs inside the render that
+   * asks for the overlay and sets the measured position, which the next render
+   * reads — React's own ordering, before paint.
+   */
+  function openPanel(
+    loaded: ReturnType<typeof loadClient>,
+    contribution: Contribution,
+    props: Record<string, unknown>,
+  ): { switch: () => { props: Record<string, unknown> } | undefined, root: () => unknown } {
+    const trigger = () => elementsOf(loaded.render(contribution.component, props))
+      .find(element => element.props['data-context-rollover-mode'] !== undefined)
+    ;(trigger()?.props['onClick'] as () => void)()
+    loaded.render(contribution.component, props)
+    const root = () => loaded.render(contribution.component, props)
+    return {
+      switch: () => elementsOf(root()).find(element => element.props['className'] === 'dsh-switch'),
+      root,
+    }
+  }
+
+  it('opens the panel on click and changes the mode from its switch', () => {
     const loaded = loadClient()
     const contribution = dockContribution(loaded)
 
-    const fromRollover = buttonFor(contribution, 'rollover')
-    ;(fromRollover.button.props['onClick'] as () => void)()
+    const fromRollover = openPanel(loaded, contribution, {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    })
+    // Opening it wrote nothing: the trigger is not a toggle any more.
+    expect(loaded.commands).toHaveLength(0)
+    const rolloverSwitch = fromRollover.switch()
+    expect(rolloverSwitch?.props['role']).toBe('switch')
+    expect(rolloverSwitch?.props['aria-checked']).toBe(true)
+    ;(rolloverSwitch?.props['onClick'] as () => void)()
     expect(loaded.commands.at(-1)).toEqual({ sessionId: 'session-1', line: '/rollover off' })
+  })
 
-    const fromCompact = buttonFor(contribution, 'compact')
-    ;(fromCompact.button.props['onClick'] as () => void)()
+  it('switches the other way from standard compaction', () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    const panel = openPanel(loaded, contribution, {
+      useProjection: () => 'compact',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    })
+    const control = panel.switch()
+    expect(control?.props['aria-checked']).toBe(false)
+    ;(control?.props['onClick'] as () => void)()
     expect(loaded.commands.at(-1)).toEqual({ sessionId: 'session-1', line: '/rollover on' })
   })
 
@@ -1152,40 +1549,41 @@ describe('browser half', () => {
       useProjection: () => 'rollover',
       ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
     }
-    const before = loaded.render(contribution.component, props) as ModeTree
-    ;(elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void)()
+    const panel = openPanel(loaded, contribution, props)
+    ;(panel.switch()?.props['onClick'] as () => void)()
     await Promise.resolve()
     await Promise.resolve()
 
     expect(loaded.commands.at(-1)).toEqual({ sessionId: 'session-1', line: '/rollover off' })
-    // Still the old mode — no optimistic flip — but the failure is visible.
-    const after = loaded.render(contribution.component, props) as ModeTree
+    // Still the old mode — no optimistic flip — but the failure is visible,
+    // both beside the trigger and inside the panel that asked for it.
+    const after = panel.root() as ModeTree
     const afterButton = elementsOf(after).find(element => element.props['data-context-rollover-mode'] !== undefined)
     expect(afterButton?.props['data-context-rollover-mode']).toBe('rollover')
     const error = elementsOf(after).find(element => element.props['className'] === 'dsh-mode-error')
     expect(String(error?.children?.[0] ?? '')).toContain('mode change rejected')
-    expect(String(afterButton?.props['title'])).toContain('mode change rejected')
+    expect(JSON.stringify(after)).toContain('mode change rejected')
   })
 
   it('treats an admission miss as a failed mode change', async () => {
     const loaded = loadClient()
     const contribution = dockContribution(loaded)
     // `undefined` is the documented admission miss: the line never reached a
-    // handler, so nothing changed and the button must not claim otherwise.
+    // handler, so nothing changed and the switch must not claim otherwise.
     loaded.commandResult.value = undefined
     const props = {
       useProjection: () => 'rollover',
       ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
     }
-    const before = loaded.render(contribution.component, props) as ModeTree
-    ;(elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void)()
+    const panel = openPanel(loaded, contribution, props)
+    ;(panel.switch()?.props['onClick'] as () => void)()
     await Promise.resolve()
     await Promise.resolve()
 
-    const after = loaded.render(contribution.component, props) as ModeTree
-    const error = elementsOf(after).find(element => element.props['className'] === 'dsh-mode-error')
+    const error = elementsOf(panel.root())
+      .find(element => element.props['className'] === 'dsh-mode-error')
     expect(error).toBeDefined()
-    // No detail is available for an admission miss, but the button still has to
+    // No detail is available for an admission miss, but the control still has to
     // say that nothing happened rather than silently keeping the old mode.
     expect(String(error?.children?.[0] ?? '')).toMatch(/模式未切换|Mode not changed/)
   })
@@ -1200,38 +1598,221 @@ describe('browser half', () => {
       useProjection: () => 'rollover',
       ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
     }
-    const before = loaded.render(contribution.component, props) as ModeTree
-    ;(elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void)()
+    const panel = openPanel(loaded, contribution, props)
+    ;(panel.switch()?.props['onClick'] as () => void)()
     await Promise.resolve()
     await Promise.resolve()
 
-    const after = loaded.render(contribution.component, props) as ModeTree
-    const error = elementsOf(after).find(element => element.props['className'] === 'dsh-mode-error')
+    const error = elementsOf(panel.root())
+      .find(element => element.props['className'] === 'dsh-mode-error')
     expect(String(error?.children?.[0] ?? '')).toContain('carrier offline')
   })
 
-  it('holds the mode button while its change is in flight', async () => {
+  it('holds the switch while its change is in flight', async () => {
     const loaded = loadClient()
     const contribution = dockContribution(loaded)
     const props = {
       useProjection: () => 'rollover',
       ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
     }
-    const before = loaded.render(contribution.component, props) as ModeTree
-    const click = elementsOf(before).find(element => element.type === 'button')?.props['onClick'] as () => void
+    const panel = openPanel(loaded, contribution, props)
+    const click = panel.switch()?.props['onClick'] as () => void
 
     click()
     // A second click before the first settles would queue the opposite change.
     click()
     expect(loaded.commands).toHaveLength(1)
-    const pending = loaded.render(contribution.component, props) as ModeTree
-    const pendingButton = elementsOf(pending).find(element => element.type === 'button')
-    expect(pendingButton?.props['disabled']).toBe(true)
+    expect(panel.switch()?.props['disabled']).toBe(true)
 
     await Promise.resolve()
     await Promise.resolve()
-    const settled = loaded.render(contribution.component, props) as ModeTree
-    const settledButton = elementsOf(settled).find(element => element.type === 'button')
-    expect(settledButton?.props['disabled']).toBe(false)
+    expect(panel.switch()?.props['disabled']).toBe(false)
+  })
+
+  /** Open the panel and let the reading the poll fetched arrive. */
+  async function panelWithReading(
+    loaded: ReturnType<typeof loadClient>,
+    props: Record<string, unknown>,
+  ): Promise<ReturnType<typeof elementsOf>> {
+    const contribution = dockContribution(loaded)
+    loaded.render(contribution.component, props)
+    // A macrotask, not a microtask: the poll's two-then chain has to finish
+    // before the render that reads it, and `await Promise.resolve()` does not
+    // order against it.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    // The placement lands one render after the click, which `openPanel` covers.
+    return elementsOf(openPanel(loaded, contribution, props).root())
+  }
+
+  it('polls the session reading and draws it: header, tier marks, and stage', async () => {
+    const loaded = loadClient()
+    const elements = await panelWithReading(loaded, {
+      useProjection: () => 'rollover',
+      ...(dockContribution(loaded).options.inject?.('session-1') as Record<string, unknown>),
+    })
+    // The reading is per session, and the control asks for its own.
+    expect(loaded.statusRequests.at(-1)).toContain('/context-rollover/status?session=session-1')
+    const figures = elements.find(element => element.props['className'] === 'dsh-panel-figures')
+    expect(String(figures?.children?.[0] ?? '')).toBe('~770K / 1M')
+    const used = elements.find(element => element.props['className'] === 'dsh-bar-used')
+    expect((used?.props['style'] as Record<string, string>)['width']).toBe('77%')
+
+    // The three rungs of the ladder, and not the compaction point while the
+    // session is in rollover mode.
+    const marks = elements.filter(element => element.props['className'] === 'dsh-bar-mark')
+    expect(marks.map(element => element.props['data-mark'])).toEqual(['notify', 'warn', 'rollover'])
+    expect(marks.map(element => (element.props['style'] as Record<string, string>)['left']))
+      .toEqual(['72%', '76%', '79%'])
+    // The band each rung opens, tinted in the same signal order as its tick:
+    // green, amber, red.
+    const zones = elements.filter(element => element.props['className'] === 'dsh-bar-zone')
+    expect(zones.map(element => [
+      element.props['data-zone'],
+      (element.props['style'] as Record<string, string>)['left'],
+      (element.props['style'] as Record<string, string>)['width'],
+    ])).toEqual([['notified', '72%', '4%'], ['lastChance', '76%', '3%'], ['past', '79%', '21%']])
+    // The key names each mark and its position, so neither has to be read off
+    // the bar's own geometry.
+    const keys = elements.filter(element => element.props['className'] === 'dsh-bar-key')
+    expect(keys.map(element => `${String(element.children?.[1] ?? '')}`))
+      .toEqual(['提示 72%', '预警 76%', '换窗 79%'])
+    // At 77% the first two rungs are behind the window and the third is the one
+    // it is heading for.
+    expect(keys.map(element => element.props['data-next'] !== undefined))
+      .toEqual([false, false, true])
+    expect(keys.map(element => element.props['data-passed'] !== undefined))
+      .toEqual([true, true, false])
+
+    const stage = elements.find(element => element.props['className'] === 'dsh-stage')
+    expect(stage?.props['data-stage']).toBe('rollover')
+    const sentence = elements.find(element => element.props['className'] === 'dsh-stage-text')
+    expect(String(sentence?.children?.[0] ?? '')).toContain('自动滚动就位')
+    // 20,000 tokens, abbreviated the way the platform's own pills abbreviate.
+    expect(String(sentence?.children?.[0] ?? '')).toContain('20K')
+  })
+
+  it('drops a stage whose band collapsed onto the next one', async () => {
+    const loaded = loadClient()
+    // The execute point lowered onto the warn point: the engine re-derives a
+    // two-tier ladder rather than refusing the edit, so the bar has two rungs,
+    // not three with two ticks in the same pixel.
+    loaded.statusPayload.value = {
+      mode: 'rollover',
+      stage: 'rollover',
+      promptTokens: 700000,
+      contextWindow: 1000000,
+      tokensToNext: 40000,
+      points: { notify: 0.72, warn: 0.74, rollover: 0.74, compact: 0.8 },
+    }
+    const elements = await panelWithReading(loaded, {
+      useProjection: () => 'rollover',
+      ...(dockContribution(loaded).options.inject?.('session-1') as Record<string, unknown>),
+    })
+    expect(elements
+      .filter(element => element.props['className'] === 'dsh-bar-mark')
+      .map(element => element.props['data-mark'])).toEqual(['notify', 'rollover'])
+    expect(elements
+      .filter(element => element.props['className'] === 'dsh-bar-zone')
+      .map(element => [
+        element.props['data-zone'],
+        (element.props['style'] as Record<string, string>)['width'],
+      ])).toEqual([['notified', '2%'], ['past', '26%']])
+    expect(elements
+      .filter(element => element.props['className'] === 'dsh-bar-key')
+      .map(element => String(element.children?.[1] ?? ''))).toEqual(['提示 72%', '换窗 74%'])
+  })
+
+  it('draws the compaction point when the window will be summarised', async () => {
+    const loaded = loadClient()
+    loaded.statusPayload.value = {
+      mode: 'compact',
+      stage: 'compacting',
+      promptTokens: 500000,
+      contextWindow: 1000000,
+      tokensToNext: 300000,
+      points: { notify: 0.72, warn: 0.76, rollover: 0.79, compact: 0.8 },
+    }
+    const elements = await panelWithReading(loaded, {
+      useProjection: () => 'compact',
+      ...(dockContribution(loaded).options.inject?.('session-1') as Record<string, unknown>),
+    })
+    // One boundary, not four: this session never crosses the plugin's three
+    // points, so drawing them would mark rungs the window will never reach.
+    expect(elements
+      .filter(element => element.props['className'] === 'dsh-bar-mark')
+      .map(element => element.props['data-mark'])).toEqual(['compact'])
+    expect(elements
+      .filter(element => element.props['className'] === 'dsh-bar-zone')
+      .map(element => element.props['data-zone'])).toEqual(['past'])
+    const keys = elements.filter(element => element.props['className'] === 'dsh-bar-key')
+    expect(keys.map(element => String(element.children?.[1] ?? ''))).toEqual(['压缩 80%'])
+    const sentence = elements.find(element => element.props['className'] === 'dsh-stage-text')
+    expect(String(sentence?.children?.[0] ?? '')).toContain('300K')
+  })
+
+  it('re-reads the moment the panel opens, so its marks are never a poll behind', async () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    const props = {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    }
+    loaded.render(contribution.component, props)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const afterMount = loaded.statusRequests.length
+    expect(afterMount).toBeGreaterThan(0)
+    // The rungs are the configuration's, and the configuration can be edited on
+    // another page between polls: opening the panel asks again rather than
+    // showing marks that are up to an interval stale.
+    openPanel(loaded, contribution, props)
+    expect(loaded.statusRequests.length).toBeGreaterThan(afterMount)
+  })
+
+  it('shows the stage sentence in the hover bubble, after the hover delay', () => {
+    vi.useFakeTimers()
+    try {
+      const loaded = loadClient()
+      const contribution = dockContribution(loaded)
+      const props = {
+        useProjection: () => 'rollover',
+        ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+      }
+      const bake = () => elementsOf(loaded.render(contribution.component, props))
+      const trigger = () => bake().find(element => element.props['data-context-rollover-mode'] !== undefined)
+      const bubble = () => bake().find(element => element.props['className'] === 'dsh-context-rollover-bubble')
+      expect(bubble()).toBeUndefined()
+      ;(trigger()?.props['onMouseEnter'] as () => void)()
+      // Not yet: the platform's tooltips wait for the pointer to settle.
+      loaded.render(contribution.component, props)
+      expect(bubble()).toBeUndefined()
+      vi.advanceTimersByTime(400)
+      // One render for the flag, one for the position it is drawn at.
+      loaded.render(contribution.component, props)
+      const shown = bubble()
+      expect(shown?.props['role']).toBe('tooltip')
+      // No reading has arrived yet, so the sentence says so rather than lying.
+      expect(String(shown?.children?.[0] ?? '')).toMatch(/尚未测量|not measured/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('closes the panel on Escape and on a press outside it', () => {
+    const loaded = loadClient()
+    const contribution = dockContribution(loaded)
+    const props = {
+      useProjection: () => 'rollover',
+      ...(contribution.options.inject?.('session-1') as Record<string, unknown>),
+    }
+    const panel = openPanel(loaded, contribution, props)
+    expect(panel.switch()).toBeDefined()
+    loaded.document.dispatch('keydown', { key: 'Escape' })
+    expect(panel.switch()).toBeUndefined()
+
+    const reopened = openPanel(loaded, contribution, props)
+    expect(reopened.switch()).toBeDefined()
+    // A press whose target is neither the entry nor the panel.
+    loaded.document.dispatch('pointerdown', { target: { closest: () => null } })
+    expect(reopened.switch()).toBeUndefined()
   })
 })

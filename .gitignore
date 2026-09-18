@@ -14,3 +14,6 @@ audit-workspace/
 # Isolated benchmark runtime, fixtures, and session artifacts (never production state)
 .bench/
 .bench-test-*/
+
+# Release artifacts are attached to a release, not committed.
+*.tgz

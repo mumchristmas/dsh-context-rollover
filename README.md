@@ -34,20 +34,40 @@ no network calls, no telemetry; the only thing it writes are markdown notes unde
 
 ## Screenshots
 
-**The switch sits where you already look.** The icon in the session stats row *is* the
-state — a recycle mark means this session rolls over, a split square means it keeps its own
-compaction backend — and the tooltip spells out what the current mode does and what a click
-switches to.
+**The countdown sits where you already look.** The icon in the session stats row is the mode
+— a recycle mark means this session rolls over, a split square means it keeps its own
+compaction backend — and hovering it says what happens next and how much prompt growth is
+left before it does: `20K tokens to the context notice`, `Notice sent · 60K tokens to the
+last-chance warning`, `Rollover armed · new window in 20K tokens`, or, on a session that will
+be summarised instead, `Compaction in 300K tokens`. The bubble is the app's own tooltip, in
+the app's own colours.
 
-![The context-mode button and its tooltip](assets/context-mode-button.webp)
+<img src="assets/context-mode-bubble.webp" alt="The rollover control and its hover tooltip" width="620">
 
-**The knobs, with the arithmetic done for you.** The settings card edits the rollover and
+Clicking opens a panel rather than switching anything, because the numbers are what a reader
+wants first: where this window stands against its three points, and the switch that changes
+the policy — the only control that does. The bar reads like a signal. Its bands and its ticks
+are green, amber, and red in the order the points fire, so the stretch the window is standing
+in and the point it is heading for are both visible at a glance, and the key under it names
+each tick and the percentage it sits at. Edit a threshold and the bar follows the new
+configuration — it is the effective one, so a shorter ladder draws fewer ticks rather than
+two in the same pixel.
+
+<img src="assets/context-mode-panel.webp" alt="The rollover panel: context used, a tiered bar, the next action, and the switch" width="620">
+
+**The knobs, with the arithmetic done for you.** The configuration form edits the rollover and
 reminder thresholds and the retained tail, and reports the backend this session compacts
 through (`compaction @ 80%` here), so the rollover threshold can stay below it.
 
-<img src="assets/rollover-settings-card.webp" alt="The Context rollover settings card" width="620">
+<img src="assets/rollover-config-form.webp" alt="The Context rollover configuration form on the bundle's page in the sidebar's Plugins tab" width="620">
 
-*Screenshots show the Chinese UI; human-facing text follows the app's language.*
+*Screenshots are the app's own UI, in the app's own language; the plugin's text follows it.*
+
+The form has one home per host. On DSH 0.1.6-alpha.2 and later, open **Plugins** in the
+sidebar and pick the `context-rollover` bundle: its configuration is the first thing on its
+page, above its rows. On earlier hosts it is the **Settings → Plugins → Context rollover**
+card. Both are registered at once and each waits for the surface its host declares, so an
+upgrade moves the form without a setting changing.
 
 ## Install
 
@@ -66,8 +86,8 @@ it into my "<profile>" profile — from the release asset, not npm — then rest
 ```
 
 By hand it is the same two commands. The profile restarts once because its plugin
-composition changed; after that, the card under **Settings → Plugin configuration** and the
-mode button under the composer show you it is live.
+composition changed; after that, the configuration page under the sidebar's **Plugins** tab
+and the rollover control under the composer show you it is live.
 
 ### Supported DSH host lines
 
@@ -151,11 +171,11 @@ plainly: Node has no `openat`, so a race between resolution and open cannot be e
 outright, and this is a per-session directory on one machine, not a sandbox.
 
 The rollover and reminder thresholds, the last-chance band, the active-request pin, and the
-retained tail live in the **Plugin configuration → Context rollover** settings card
+retained tail live in the **Plugins → context-rollover** configuration form
 (`thresholdRatio: 0.79`, `lastChanceRatio: 0.76` and `reminderThresholdRatio: 0.72` by
 default; the tail is edited in tokens, and empty means the deployment's share of the
 window, `retainRatio: 0.1`). Every knob also has a row in the plugin's `cordis.yml`. All
-three are *points*, so the card prints them as one numbered scale, with the width of the
+three are *points*, so the form prints them as one numbered scale, with the width of the
 last stretch (79 − 76) shown as the arithmetic it is.
 
 ### These defaults assume a large window
