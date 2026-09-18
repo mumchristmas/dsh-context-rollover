@@ -68,8 +68,8 @@
 请把 dsh-context-rollover 的最新 release 附件下载到当前工作目录，并把它装进我的
 "<profile>" profile —— 用 release 附件，不要用 npm —— 然后重启该 profile：
 
-  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.3.3.tgz
-  dsh plugin --profile <profile> add ./dsh-context-rollover-0.3.3.tgz
+  curl -LO https://github.com/mumchristmas/dsh-context-rollover/releases/latest/download/dsh-context-rollover-0.4.0.tgz
+  dsh plugin --profile <profile> add ./dsh-context-rollover-0.4.0.tgz
 ```
 
 手工执行就是同样两条命令。因为插件组合变了，profile 需要重启一次；之后侧边栏 **Plugins** 里
